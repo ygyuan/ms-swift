@@ -1,0 +1,10 @@
+Looking in indexes: https://mirrors.cloud.tencent.com/pypi/simple/
+Requirement already satisfied: qwen_vl_utils in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (0.0.14)
+Requirement already satisfied: av in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from qwen_vl_utils) (17.0.1)
+Requirement already satisfied: packaging in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from qwen_vl_utils) (25.0)
+Requirement already satisfied: pillow in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from qwen_vl_utils) (11.3.0)
+Requirement already satisfied: requests in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from qwen_vl_utils) (2.32.5)
+Requirement already satisfied: charset_normalizer<4,>=2 in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from requests->qwen_vl_utils) (3.4.4)
+Requirement already satisfied: idna<4,>=2.5 in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from requests->qwen_vl_utils) (3.11)
+Requirement already satisfied: urllib3<3,>=1.21.1 in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from requests->qwen_vl_utils) (2.6.2)
+Requirement already satisfied: certifi>=2017.4.17 in /data/miniconda3/envs/env-3.12.11/lib/python3.12/site-packages (from requests->qwen_vl_utils) (2025.11.12)

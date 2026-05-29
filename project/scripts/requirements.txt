@@ -1,0 +1,15 @@
+# Pin versions to match project/scripts/fix_env.sh.
+# Driver supports CUDA 12.2 at most -> use torch 2.4.1 + cu121 wheels.
+# trl/transformers must stay on torch-2.4-compatible versions.
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+
+transformers==4.49.0
+trl==0.18.2
+deepspeed<0.19
+
+ms-swift
+liger-kernel
