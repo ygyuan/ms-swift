@@ -8,7 +8,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3.5-2B/v12-20260423-120546/checkpoint-3736}"
+# export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3.5-2B/v12-20260423-120546/checkpoint-3736}"
+export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3.5-2B/v13/v1-20260529-140829/checkpoint-1200}"
 export TEST_PARQUET="${TEST_PARQUET:-/apdcephfs_qy3/share_301069248/huggingface/gsm8k/main/test-00000-of-00001.parquet}"
 export OUT_FILE="${OUT_FILE:-${CKPT}/infer_gsm8k.jsonl}"
 export GPU="${GPU:-0,1}"

@@ -4,8 +4,8 @@
 Evaluate GSM8K inference output produced by `infer_gsm8k_qwen3.5.sh`.
 
 Usage:
-    python eval_gsm8k.py --infer_file <path>/infer_gsm8k.jsonl
-    python eval_gsm8k.py --infer_file <path>/infer_gsm8k.jsonl --report <path>/report.json
+    python eval_gsm8k.py --infer_file <path>/infer_gsm8k.jsonl \
+        --gt_parquet /path/to/gsm8k/test.parquet
 """
 import argparse
 import json
@@ -46,11 +46,44 @@ def has_format(text: str) -> bool:
     )
 
 
-def load_response(item: dict) -> Tuple[str, str]:
-    """Return (response_text, gt_solution) from a swift infer jsonl record."""
-    # gt
+def get_user_question(item: dict) -> str:
+    """Extract user question text from a swift-infer record's `messages`."""
+    msgs = item.get("messages") or []
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "user":
+            return str(m.get("content", "")).strip()
+    return ""
+
+
+def build_gt_lookup(gt_parquet: str) -> Dict[str, str]:
+    """Build {question -> answer} dict from a GSM8K parquet file."""
+    if not gt_parquet:
+        return {}
+    if not os.path.exists(gt_parquet):
+        print(f"[warn] gt_parquet not found: {gt_parquet}", file=sys.stderr)
+        return {}
+    import pandas as pd
+    df = pd.read_parquet(gt_parquet)
+    if "question" not in df.columns or "answer" not in df.columns:
+        print(f"[warn] parquet missing 'question'/'answer' columns: {list(df.columns)}", file=sys.stderr)
+        return {}
+    lookup = {str(q).strip(): str(a) for q, a in zip(df["question"], df["answer"])}
+    print(f"[gt] loaded {len(lookup)} ground-truth answers from {gt_parquet}")
+    return lookup
+
+
+def load_response(item: dict, gt_lookup: Dict[str, str]) -> Tuple[str, str]:
+    """Return (response_text, gt_solution) from a swift-infer jsonl record.
+
+    Ground-truth lookup priority:
+        1. item['solution'] / item['labels']  (legacy in-record fields)
+        2. gt_lookup[user_question]           (parquet fallback, the normal path
+           when swift infer drops the `solution` column).
+    """
     gt = item.get("solution") or item.get("labels") or ""
-    # response: try common fields
+    if not gt:
+        q = get_user_question(item)
+        gt = gt_lookup.get(q, "")
     resp = item.get("response")
     if resp is None:
         choices = item.get("choices") or []
@@ -65,6 +98,8 @@ def load_response(item: dict) -> Tuple[str, str]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--infer_file", required=True, help="Path to infer_gsm8k.jsonl")
+    ap.add_argument("--gt_parquet", default="",
+                    help="GSM8K test parquet to look up ground truth when infer file lacks 'solution' field.")
     ap.add_argument("--report", default="", help="Optional path to dump JSON report")
     ap.add_argument("--show_errors", type=int, default=5, help="Print N error samples")
     args = ap.parse_args()
@@ -73,9 +108,12 @@ def main():
         print(f"[error] file not found: {args.infer_file}", file=sys.stderr)
         sys.exit(1)
 
+    gt_lookup = build_gt_lookup(args.gt_parquet)
+
     n_total = 0
     n_correct = 0
     n_format = 0
+    n_no_gt = 0
     errors = []
 
     with open(args.infer_file, "r", encoding="utf-8") as f:
@@ -87,7 +125,7 @@ def main():
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            resp, gt = load_response(item)
+            resp, gt = load_response(item, gt_lookup)
             gt_num = extract_answer(gt)
             pred_num = extract_answer(resp)
             ok = is_correct(pred_num, gt_num)
@@ -95,6 +133,8 @@ def main():
             n_total += 1
             n_correct += int(ok)
             n_format += int(fmt)
+            if not gt_num:
+                n_no_gt += 1
             if not ok and len(errors) < args.show_errors:
                 errors.append({"gt": gt_num, "pred": pred_num, "resp_tail": resp[-200:]})
 
@@ -105,12 +145,14 @@ def main():
     acc = n_correct / n_total
     fmt_rate = n_format / n_total
     print("=" * 60)
-    print(f"GSM8K Evaluation Report")
+    print("GSM8K Evaluation Report")
     print(f"  file       : {args.infer_file}")
     print(f"  total      : {n_total}")
     print(f"  correct    : {n_correct}")
     print(f"  accuracy   : {acc:.4f}")
     print(f"  format_rate: {fmt_rate:.4f}")
+    if n_no_gt:
+        print(f"  WARN missing-gt samples: {n_no_gt} (counted as wrong)")
     print("=" * 60)
     if errors:
         print("\n[Sample errors]")
@@ -128,6 +170,7 @@ def main():
                     "correct": n_correct,
                     "accuracy": acc,
                     "format_rate": fmt_rate,
+                    "missing_gt": n_no_gt,
                 },
                 f,
                 ensure_ascii=False,
