@@ -252,7 +252,7 @@ This list inherits from the Transformers `Seq2SeqTrainingArguments`, with ms-swi
 - 🔥vit_lr: Specifies the learning rate for the ViT module when training multimodal models. Default is `None`, same as `learning_rate`. Typically used together with `--freeze_vit` and `--freeze_aligner`.
   - Note: The "learning_rate" printed in the logs is the learning rate of `param_groups[0]`, where the order of param_groups is vit, aligner, llm (if it contains trainable parameters).
 - 🔥aligner_lr: Specifies the learning rate for the aligner module in multimodal models. Default is `None`, same as `learning_rate`.
-- lr_scheduler_type: Type of learning rate scheduler. Default is `'cosine'`.
+- lr_scheduler_type: The type of learning rate scheduler, defaults to `'cosine'`. Common options: `'linear'`, `'constant'`, `'cosine_with_min_lr'`.
 - lr_scheduler_kwargs: Additional arguments for the learning rate scheduler. Default is `None`.
 - gradient_checkpointing_kwargs: Arguments passed to `torch.utils.checkpoint`. For example: `--gradient_checkpointing_kwargs '{"use_reentrant": false}'`. Default is `None`.
   - Note: When using DDP without DeepSpeed/FSDP and `gradient_checkpointing_kwargs` is `None`, it defaults to `'{"use_reentrant": false}'` to prevent errors.
@@ -321,6 +321,7 @@ Other important parameters:
   - Note: The behavior of `'all-linear'` differs between LLMs and multimodal LLMs. For standard LLMs, it automatically finds all linear layers except `lm_head` and attaches tuners. **For multimodal LLMs, tuners are by default only attached to the LLM component; this behavior can be controlled via `freeze_llm`, `freeze_vit`, and `freeze_aligner`**.
 - 🔥target_regex: A regular expression to specify LoRA modules. Default is `None`. If provided, `target_modules` is ignored. For example: `--target_regex '^(language_model).*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'` applies LoRA to modules matching the pattern. This argument is not limited to LoRA and can be used with other tuners.
 - target_parameters: List of parameter names (not module names) to replace with LoRA. Similar in behavior to `target_modules`, but operates at the parameter level. Requires "peft>=0.17.0". This is useful for models like Mixture-of-Experts (MoE) layers in Hugging Face Transformers, which may use `nn.Parameter` instead of `nn.Linear`.
+  - Note: This parameter requires `lora_dropout` to be set to 0.
 - init_weights: Method for initializing weights. For LoRA: options are 'true', 'false', 'gaussian', 'pissa', 'pissa_niter_[number of iters]', 'olora', 'loftq', 'lora-ga'. For Bone: 'true', 'false', 'bat'. Default is 'true'.
 - 🔥modules_to_save: Additional original model modules to include in training and saving, even after attaching a tuner. Default is `[]`. Applies to tuners beyond LoRA. For example: `--modules_to_save embed_tokens lm_head` enables training of `embed_tokens` and `lm_head` during LoRA training, and their weights will be saved in `adapter_model.safetensors`.
 
@@ -694,6 +695,8 @@ The hyperparameters for the reward function can be found in the [Built-in Reward
 - move_model_batches: When moving model parameters to fast inference frameworks such as vLLM/LMDeploy, determines how many batches to divide the layers into. The default is `None`, which means the entire model is not split. Otherwise, the model is split into `move_model_batches + 1` (non-layer parameters) + `1` (multi-modal component parameters) batches.
 - multi_turn_scheduler: Multi-turn GRPO parameter; pass the corresponding plugin name, and make sure to implement it in plugin/multi_turn.py.
 - max_turns: Maximum number of rounds for multi-turn GRPO. The default is None, which means there is no limit.
+- gym_env: Globally select the gym environment name (must be registered in the plugin). Defaults to None and can be overridden per row via `env_config.name`. See the [documentation](./GRPO/DeveloperGuide/gym_env.md).
+- use_gym_env: Whether to use the env-provided `total_reward` as the reward (no reward function required). Defaults to None; when not set explicitly, it is auto-enabled if `gym_env` is set, otherwise inherited from the rollout server in server mode, and False in all other cases.
 - top_entropy_quantile: Only tokens whose entropy ranks within the specified top quantile are included in the loss calculation. The default is 1.0, which means low-entropy tokens are not filtered. For details, refer to the [documentation](./GRPO/AdvancedResearch/entropy_mask.md).
 - log_entropy: Logs the entropy values during training. The default is False. For more information, refer to the [documentation](./GRPO/GetStarted/GRPO.md#logged-metrics).
 - rollout_importance_sampling_mode: Training-inference mismatch correction mode. Options are `token_truncate`, `token_mask`, `sequence_truncate`, `sequence_mask`. Default is None (disabled). For details, refer to the [documentation](./GRPO/AdvancedResearch/training_inference_mismatch.md).
@@ -754,8 +757,11 @@ Deployment Arguments inherit from the [inference arguments](#inference-arguments
 The rollout parameters inherit from the [deployment parameters](#deployment-arguments).
 - multi_turn_scheduler: The scheduler for multi-turn GRPO training. Pass the corresponding plugin name, and ensure the implementation is added in `plugin/multi_turn.py`. Default is `None`. See [documentation](./GRPO/DeveloperGuide/multi_turn.md) for details.
 - max_turns: Maximum number of turns in multi-turn GRPO training. Default is `None`, meaning no limit.
+- gym_env: Globally select the gym environment name (must be registered in the plugin). Defaults to None and can be overridden per row via `env_config.name`. See the [documentation](./GRPO/DeveloperGuide/gym_env.md).
+- use_gym_env: Whether to enable gym-environment mode (rollout emits `total_reward` for the trainer to consume). Defaults to None; when not set explicitly, it is auto-enabled if `gym_env` is set.
 - vllm_enable_lora: Enable the vLLM engine to load LoRA adapters; defaults to False. Used to accelerate weight synchronization during LoRA training. See the [documentation](./GRPO/GetStarted/GRPO.md#weight-sync-acceleration) for details.
 - vllm_max_lora_rank: LoRA parameter for the vLLM engine. Must be greater than or equal to the training lora_rank; it is recommended to set them equal. Defaults to 16.
+- vllm_enable_expert_parallel: Enable Expert Parallel (EP) for MoE models, distributing experts across ranks. Valid when vllm_use_async_engine is true. Default is False.
 
 ### Web-UI Arguments
 - server_name: Host for the web UI, default is '0.0.0.0'.
@@ -959,7 +965,7 @@ The meanings of the following parameters can be found in the example code [here]
 
 
 ## Other Environment Variables
-
+- USE_HF: Use ModelScope/HuggingFace. Defaults to '0'.
 - CUDA_VISIBLE_DEVICES: Controls which GPU to use. By default, all GPUs are used.
 - ASCEND_RT_VISIBLE_DEVICES: Controls which NPU (effective for ASCEND cards) are used. By default, all NPUs are used.
 - MODELSCOPE_CACHE: Controls the cache path. (Recommended to set this value during multi-node training to ensure all nodes use the same dataset cache.)

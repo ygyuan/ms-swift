@@ -251,10 +251,11 @@ class MLLMModelType:
     gemma3_vision = 'gemma3_vision'
     gemma3n = 'gemma3n'
     gemma4 = 'gemma4'
+    gemma4_unified = 'gemma4_unified'
     mistral3 = 'mistral3'
     mistral3_2506 = 'mistral3_2506'
     paddle_ocr = 'paddle_ocr'
-    paddle_ocr_1_5 = 'paddle_ocr_1_5'
+    paddleocr_vl = 'paddleocr_vl'
     hunyuan_ocr = 'hunyuan_ocr'
     step3_vl = 'step3_vl'
 

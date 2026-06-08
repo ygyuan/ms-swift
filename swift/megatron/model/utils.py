@@ -52,6 +52,7 @@ def get_mcore_model_config(args, hf_config):
     kwargs['params_dtype'] = args.torch_dtype
     kwargs['num_layers_in_first_pipeline_stage'] = args.decoder_first_pipeline_num_layers
     kwargs['num_layers_in_last_pipeline_stage'] = args.decoder_last_pipeline_num_layers
+    kwargs['fp4_param'] = args.fp4_param_gather
     kwargs['fp8_param'] = args.fp8_param_gather
     swiglu = kwargs.get('swiglu', True)
     add_bias_linear = kwargs.get('add_bias_linear', False)
@@ -69,6 +70,8 @@ def get_mcore_model_config(args, hf_config):
 
     if args.router_replay_mode != 'disabled':
         kwargs['moe_enable_routing_replay'] = True
+    if args.megatron_extra_kwargs:
+        kwargs.update(args.megatron_extra_kwargs)
     config = ModelConfig(**kwargs)
     if is_torch_npu_available() and getattr(args, 'attention_backend', 'flash') != 'local':
         setattr(config, 'use_flash_attn', True)

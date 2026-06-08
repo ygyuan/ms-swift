@@ -85,13 +85,14 @@ class MLLMModelArch:
     megrez_omni = 'megrez_omni'
     valley = 'valley'
     gemma3n = 'gemma3n'
+    gemma4_unified = 'gemma4_unified'
     keye_vl = 'keye_vl'
 
     midashenglm = 'midashenglm'
     step_audio2_mini = 'step_audio2_mini'
     hunyuan_vl = 'hunyuan_vl'
     step3_vl = 'step3_vl'
-    paddle_ocr_1_5 = 'paddle_ocr_1_5'
+    paddleocr_vl = 'paddleocr_vl'
 
 
 class ModelArch(LLMModelArch, MLLMModelArch):
@@ -753,6 +754,13 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
+        MLLMModelArch.gemma4_unified,
+        language_model=['model.language_model', 'lm_head'],
+        aligner=['model.embed_vision', 'model.embed_audio'],
+    ))
+
+register_model_arch(
+    MultiModelKeys(
         MLLMModelArch.keye_vl,
         language_model=['model', 'lm_head'],
         aligner='mlp_AR',
@@ -790,7 +798,7 @@ register_model_arch(
 
 register_model_arch(
     MultiModelKeys(
-        MLLMModelArch.paddle_ocr_1_5,
+        MLLMModelArch.paddleocr_vl,
         language_model=['model.language_model', 'lm_head'],
         aligner='model.projector',
         vision_tower='model.visual',
