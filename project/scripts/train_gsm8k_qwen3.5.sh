@@ -10,7 +10,7 @@ SYSTEM_PROMPT="""You are a helpful math assistant. Solve the problem step by ste
 
 MODEL_PATH=/apdcephfs_qy3/share_301069248/huggingface/Qwen3.5-2B
 DATASET_PATH=/apdcephfs_qy3/share_301069248/huggingface/gsm8k
-OUTPUT_DIR=/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3.5-2B/v13
+OUTPUT_DIR=/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3.5-2B/v14
 
 CUDA_VISIBLE_DEVICES=0,1 \
 NPROC_PER_NODE=2 \
