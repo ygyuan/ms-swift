@@ -42,8 +42,26 @@ TEMPLATE="${TEMPLATE:-qwen3}"
 # Match training (--enable_thinking false) so the model does not emit
 # <think>...</think> blocks that would hurt format_rate.
 ENABLE_THINKING="${ENABLE_THINKING:-false}"
+# Suppress the empty `<think>\n\n</think>\n\n` block that Qwen3's chat template
+# normally injects as the assistant response prefix even when
+# enable_thinking=false. Setting `--response_prefix ''` tells swift to use an
+# empty string instead of the meta default `non_thinking_prefix`, which:
+#   1. removes the <think></think> tokens from the prompt's assistant prefix,
+#      so the prompt fed to the model truly has no think scaffolding;
+#   2. removes the same string from the recorded `response` field (swift
+#      otherwise prepends `response_prefix` back to the response text in
+#      base.py: `response = response_prefix + response`).
+# As a result the jsonl response starts directly with the predicted category.
+# Set to "keep" to restore the default behavior.
+STRIP_THINK_PREFIX="${STRIP_THINK_PREFIX:-true}"
 # Optional: cap the number of evaluation samples (0 = use all).
 MAX_SAMPLES="${MAX_SAMPLES:-0}"
+# Emit per-token logprobs in the result jsonl. The downstream evaluator
+# (eval_event.py) reads `choices[0].logprobs.content[0].logprob` (i.e. the
+# first generated token) as a per-sample confidence in [0,1] (= exp(logprob))
+# to compute precision/recall/F1 vs threshold curves.
+LOGPROBS="${LOGPROBS:-true}"
+TOP_LOGPROBS="${TOP_LOGPROBS:-3}"
 
 # ===== Build a swift-compatible jsonl from the alpaca-style test jsonl =====
 PROMPT_JSONL="${CKPT}/event_test_prompts.jsonl"
@@ -78,7 +96,7 @@ with open(src, "r", encoding="utf-8") as fr, open(dst, "w", encoding="utf-8") as
                 {"role": "user",   "content": inp},
             ],
             "label": str(label),
-            "solution": str(label),  # also keep `solution`, matching --columns mapping
+            "solution": str(label),  # also keep 'solution', matching --columns mapping
         }
         fw.write(json.dumps(item, ensure_ascii=False) + "\n")
         n += 1
@@ -99,6 +117,24 @@ fi
 IFS=',' read -ra GPU_ARR <<< "${GPU}"
 NUM_GPUS=${#GPU_ARR[@]}
 echo "[infer] backend=${BACKEND}, gpus=${GPU} (n=${NUM_GPUS})"
+
+# Build the --response_prefix arg lazily so we can pass an empty string
+# when STRIP_THINK_PREFIX=true. swift's CLI parses `--response_prefix ''`
+# as a literal empty value (its priority is higher than `non_thinking_prefix`,
+# see swift/template/base.py:_get_response_prefix), suppressing the
+# default `<think>\n\n</think>\n\n` block from both the prompt and the
+# recorded response.
+# NOTE: We must use a bash array (not a plain string) here, otherwise word
+# splitting would turn `--response_prefix ""` into the two literal tokens
+# `--response_prefix` and `""` (the quote characters themselves), and
+# argparse would receive '""' as the prefix value -- not an empty string.
+RESPONSE_PREFIX_ARGS=()
+if [ "${STRIP_THINK_PREFIX}" = "true" ] || [ "${STRIP_THINK_PREFIX}" = "1" ]; then
+    RESPONSE_PREFIX_ARGS=(--response_prefix "")
+    echo "[infer] STRIP_THINK_PREFIX=true -> --response_prefix '' (no <think></think> in output)"
+else
+    echo "[infer] STRIP_THINK_PREFIX=false -> keep template default non_thinking_prefix"
+fi
 
 run_shard() {
     local gpu_id="$1"
@@ -121,6 +157,9 @@ run_shard() {
             --temperature ${TEMPERATURE} \
             --top_p 1.0 \
             --enable_thinking ${ENABLE_THINKING} \
+            "${RESPONSE_PREFIX_ARGS[@]}" \
+            --logprobs ${LOGPROBS} \
+            --top_logprobs ${TOP_LOGPROBS} \
             --stream false \
             --result_path "${shard_out}" > "${log_file}" 2>&1
     else
@@ -136,6 +175,9 @@ run_shard() {
             --temperature ${TEMPERATURE} \
             --top_p 1.0 \
             --enable_thinking ${ENABLE_THINKING} \
+            "${RESPONSE_PREFIX_ARGS[@]}" \
+            --logprobs ${LOGPROBS} \
+            --top_logprobs ${TOP_LOGPROBS} \
             --stream false \
             --result_path "${shard_out}" > "${log_file}" 2>&1
     fi
@@ -207,3 +249,104 @@ PYEOF
 fi
 
 echo "[infer] done -> ${OUT_FILE}"
+
+# ===== Post-process: strip leading empty-think block from response & logprobs =====
+# Some checkpoints (e.g. those whose tokenizer's chat_template hard-codes
+#   '<think>\n\n</think>\n\n' for enable_thinking=false at the assistant
+#   generation prompt position) are trained to *generate* this empty think
+# block as the very first tokens of the answer, even when swift sets
+# `--response_prefix ''` (which only suppresses the *prompt-side* prefix, not
+# the model's own learned behavior).
+#
+# Concretely, the per-token logprobs sequence in such jsonl looks like:
+#   tokens[0..3] = '<think>', '\n\n', '</think>', '\n\n'   (logprob ~0)
+#   tokens[4..]  = the real answer (e.g. '安全', '恶意', ...)
+# We strip the leading think block (if any) from BOTH the textual `response`
+# field AND the `logprobs.content` array, so that downstream consumers
+# (eval_event.py, threshold sweep, etc.) see logprobs[0] as the first
+# *answer* token directly, without needing any compatibility shim.
+#
+# Set STRIP_THINK_POSTPROC=false to skip this rewrite (e.g. for debugging).
+STRIP_THINK_POSTPROC="${STRIP_THINK_POSTPROC:-true}"
+if [ "${STRIP_THINK_POSTPROC}" = "true" ] || [ "${STRIP_THINK_POSTPROC}" = "1" ]; then
+    echo "[postproc] stripping leading <think>...</think> from response & logprobs in ${OUT_FILE}"
+    /data/miniconda3/envs/env-3.12.11/bin/python - <<PYEOF
+import json, os, re, sys
+src = "${OUT_FILE}"
+tmp = src + ".tmp"
+
+# Match a leading <think>...</think> block (with optional surrounding
+# whitespace/newlines) at the very start of the response.
+THINK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
+# Tokens that the model emits as part of the empty-think scaffolding.
+# We only drop a contiguous prefix of these, stopping at the first
+# non-think token (so we never accidentally drop real answer tokens that
+# happen to be whitespace).
+THINK_TOKEN_SET = {"<think>", "</think>"}
+WS_TOKEN_SET = {"\n", "\n\n", " ", "  ", "\t"}
+
+n_in = 0
+n_stripped_text = 0
+n_stripped_logprobs = 0
+with open(src, "r", encoding="utf-8") as fr, open(tmp, "w", encoding="utf-8") as fw:
+    for line in fr:
+        line = line.rstrip("\n")
+        if not line.strip():
+            continue
+        n_in += 1
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            fw.write(line + "\n")
+            continue
+        # 1) strip from textual response
+        resp = obj.get("response")
+        if isinstance(resp, str):
+            new_resp = THINK_RE.sub("", resp, count=1)
+            if new_resp != resp:
+                obj["response"] = new_resp
+                n_stripped_text += 1
+        # 2) strip aligned prefix from logprobs.content
+        lp = obj.get("logprobs")
+        if isinstance(lp, dict):
+            content = lp.get("content")
+            if isinstance(content, list) and content:
+                # Find end of the leading '<think>...</think>(\n\n)?' run.
+                # Walk forward until we have seen </think> AND consumed any
+                # immediately following whitespace tokens, then cut.
+                seen_close = False
+                cut = 0
+                for i, tok in enumerate(content):
+                    if not isinstance(tok, dict):
+                        break
+                    t = tok.get("token", "")
+                    if not seen_close:
+                        if t in THINK_TOKEN_SET or t in WS_TOKEN_SET or t == "":
+                            if t == "</think>":
+                                seen_close = True
+                            cut = i + 1
+                            continue
+                        else:
+                            # First non-think, non-ws token before seeing </think>:
+                            # the response does not start with a think block in
+                            # the token stream -> do not strip anything.
+                            cut = 0
+                            break
+                    else:
+                        # already past </think>: only consume immediately
+                        # following whitespace tokens, then stop.
+                        if t in WS_TOKEN_SET:
+                            cut = i + 1
+                            continue
+                        break
+                if cut > 0 and seen_close:
+                    lp["content"] = content[cut:]
+                    n_stripped_logprobs += 1
+        fw.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+os.replace(tmp, src)
+print(f"[postproc] processed {n_in} lines; stripped think from response in {n_stripped_text}, from logprobs in {n_stripped_logprobs}")
+PYEOF
+fi
+
+echo "[infer] done (post-processed) -> ${OUT_FILE}"

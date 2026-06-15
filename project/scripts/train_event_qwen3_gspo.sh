@@ -19,8 +19,8 @@ NPROC_PER_NODE=2 \
     --external_plugins examples/train/grpo/plugin/event/event_plugin.py \
     --reward_funcs event_accuracy event_format \
     --reward_weights 1.0 0.1 \
-    --columns '{"label": "solution"}' \
     --enable_thinking false \
+    --response_prefix '' \
     --use_vllm true \
     --vllm_mode colocate \
     --vllm_gpu_memory_utilization 0.5 \
@@ -35,7 +35,7 @@ NPROC_PER_NODE=2 \
     --max_length 6144 \
     --max_completion_length 2048 \
     --truncation_strategy delete \
-    --num_train_epochs 1 \
+    --num_train_epochs 5 \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 8 \
     --learning_rate 1e-6 \

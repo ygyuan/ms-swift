@@ -21,9 +21,11 @@ Notes:
 """
 import argparse
 import json
+import math
 import os
+import re
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Make event_plugin importable regardless of where this script is launched from.
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +42,25 @@ from event_plugin import (  # type: ignore  # noqa: E402
     _get_prompt_text,
     _normalize_gt_label,
 )
+
+
+# Qwen3 chat template still emits an empty `<think>\n\n</think>\n\n` block at
+# the head of every reply even when `enable_thinking=false`. We strip it from
+# both the `response` text (so ORMs see a clean answer body) and from the
+# logprob token sequence (so the "first answer token" used as a confidence
+# proxy is the actual category/`<explanation>` token, not `<think>`).
+_THINK_BLOCK_RE = re.compile(r"^\s*<think>.*?</think>\s*", re.DOTALL)
+# Tokens that belong to the head of the reply but are NOT meaningful answer
+# content. Anything that is exactly one of these (after surrounding whitespace
+# is removed) is skipped when locating the first "real" answer token.
+_THINK_SKIP_TOKENS = {"<think>", "</think>", "think", "/think", "<", ">", "</"}
+
+
+def _strip_think_prefix(text: str) -> str:
+    """Remove a leading ``<think>...</think>`` block from a model response."""
+    if not text:
+        return text
+    return _THINK_BLOCK_RE.sub("", text, count=1)
 
 
 def get_user_text(item: dict) -> str:
@@ -107,7 +128,188 @@ def load_response(item: dict, gt_lookup: Dict[str, str]) -> Tuple[str, str]:
             resp = choices[0].get("message", {}).get("content", "")
     if resp is None:
         resp = item.get("generated_text", "") or ""
-    return str(resp), str(gt)
+    # Qwen3 always prepends an empty `<think>\n\n</think>\n\n` block; remove
+    # it so the downstream ORMs (EventAccuracy/EventFormat) see only the
+    # actual answer body ("<category>\n<explanation>...</explanation>").
+    resp = _strip_think_prefix(str(resp))
+    return resp, str(gt)
+
+
+def _extract_first_answer_token_logprob(item: dict) -> Optional[float]:
+    """Logprob of the first *answer* token in a swift-infer record.
+
+    Qwen3 output starts with an empty think block:
+        <think>\\n\\n</think>\\n\\n<actual answer ...>
+    The bare "first generated token" is therefore always ``<think>`` and
+    carries no information about the model's confidence on the predicted
+    label. Instead, walk the per-token logprob sequence and return the
+    logprob of the first token that is not part of the empty think block,
+    nor pure whitespace -- i.e. the first token that belongs to the actual
+    answer (typically ``<`` of ``<explanation>``, or the first character of
+    the predicted category name).
+
+    swift writes per-token logprobs in two possible places depending on
+    backend / version:
+      1. Top-level: ``item['logprobs'] = {'content': [{'token','logprob',...}, ...]}``
+         (see swift/pipelines/infer/infer.py: ``'logprobs': resp.choices[0].logprobs``).
+      2. Inside choices: ``item['choices'][0]['logprobs'] = {...}`` (OpenAI-style).
+
+    Returns the answer-token logprob (a non-positive float), or None when
+    logprobs were not requested / not available.
+    """
+    candidates = []
+    lp = item.get("logprobs")
+    if lp:
+        candidates.append(lp)
+    choices = item.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        lp2 = choices[0].get("logprobs")
+        if lp2:
+            candidates.append(lp2)
+
+    for lp in candidates:
+        if not isinstance(lp, dict):
+            continue
+        content = lp.get("content") or []
+        if not content:
+            continue
+
+        # Walk the token stream and skip the leading think block.
+        # Strategy:
+        #   - Skip any token whose stripped text is empty (pure whitespace /
+        #     newline) or is a structural piece of the think block (the tags
+        #     and their fragments after BPE splitting).
+        #   - Once we have seen the closing ``</think>`` tag, every subsequent
+        #     non-whitespace token is fair game; before seeing it we still
+        #     skip whitespace but allow the loop to fall through to the
+        #     fallback-first-non-whitespace branch in case logprobs were
+        #     produced without a think block at all.
+        seen_close_think = False
+        first_non_ws_idx: Optional[int] = None
+        for idx, tok in enumerate(content):
+            if not isinstance(tok, dict):
+                continue
+            raw = tok.get("token")
+            if raw is None:
+                continue
+            stripped = str(raw).strip()
+            if not stripped:
+                continue
+            if first_non_ws_idx is None:
+                first_non_ws_idx = idx
+            if not seen_close_think and stripped in _THINK_SKIP_TOKENS:
+                if stripped == "</think>" or stripped == "/think":
+                    seen_close_think = True
+                continue
+            # First "real" answer token.
+            try:
+                return float(tok["logprob"])
+            except (TypeError, ValueError, KeyError):
+                continue
+
+        # Fallback: if we never identified a clean answer token (e.g. the
+        # output had no think block, or used unusual tokenisation), use the
+        # first non-whitespace token's logprob -- still better than the
+        # naive content[0].
+        if first_non_ws_idx is not None:
+            tok = content[first_non_ws_idx]
+            try:
+                return float(tok["logprob"])
+            except (TypeError, ValueError, KeyError):
+                pass
+    return None
+
+
+def _logprob_to_prob(lp: Optional[float]) -> Optional[float]:
+    """Map a logprob into a probability in [0, 1] via ``exp``. None passthrough."""
+    if lp is None:
+        return None
+    try:
+        p = math.exp(lp)
+    except OverflowError:
+        return 1.0
+    # Clamp to guard against tiny numerical overshoots.
+    if p < 0.0:
+        return 0.0
+    if p > 1.0:
+        return 1.0
+    return p
+
+
+def _build_threshold_grid() -> List[float]:
+    """Default threshold grid for the P/R/F1 sweep.
+
+    Dense near 0 / 1 (where the curves typically bend), uniform in between.
+    """
+    grid = set()
+    for x in (0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3,
+              0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75,
+              0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 0.99, 0.995, 0.999):
+        grid.add(round(x, 4))
+    return sorted(grid)
+
+
+def compute_threshold_curve(
+    correctness: List[int],
+    confidences: List[Optional[float]],
+    thresholds: List[float],
+) -> Tuple[List[Dict[str, float]], Optional[Dict[str, float]]]:
+    """Sweep ``thresholds`` and compute reject-option P/R/F1 metrics.
+
+    Semantics (single-threshold reject-option for multi-class classification):
+      * accept sample iff confidence >= threshold
+      * TP = #accepted & correct
+      * FP = #accepted & wrong
+      * FN = #rejected & correct + #rejected & wrong  (everything not accepted
+              cannot recover a TP, so rejected-correct also counts as FN here)
+      * precision = TP / (TP + FP)              (accuracy on accepted)
+      * recall    = TP / N                       (== coverage * precision)
+      * F1        = 2PR / (P + R)
+      * coverage  = (TP + FP) / N
+
+    Samples missing a confidence score are treated as confidence=NaN, i.e.
+    they are rejected for any threshold > 0 but accepted at threshold 0.
+
+    Returns (curve, best_f1_point). ``best_f1_point`` is None when curve empty.
+    """
+    n = len(correctness)
+    assert n == len(confidences)
+    curve: List[Dict[str, float]] = []
+    for tau in thresholds:
+        tp = fp = 0
+        accepted = 0
+        for ok, c in zip(correctness, confidences):
+            if c is None:
+                # No confidence available -> reject for any tau > 0,
+                # accept only at tau == 0 (so the tau=0 row reproduces the
+                # raw accuracy from the existing report).
+                accept = (tau <= 0.0)
+            else:
+                accept = (c >= tau)
+            if accept:
+                accepted += 1
+                if ok:
+                    tp += 1
+                else:
+                    fp += 1
+        precision = (tp / accepted) if accepted > 0 else 0.0
+        recall = tp / n if n > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        coverage = accepted / n if n > 0 else 0.0
+        curve.append({
+            "threshold": float(tau),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "coverage": float(coverage),
+            "tp": int(tp),
+            "fp": int(fp),
+            "accepted": int(accepted),
+        })
+    if not curve:
+        return curve, None
+    best = max(curve, key=lambda r: (r["f1"], r["threshold"]))
+    return curve, dict(best)
 
 
 def main():
@@ -131,6 +333,7 @@ def main():
     labels: List[str] = []
     messages: List[list] = []
     raw_records: List[dict] = []
+    first_token_logprobs: List[Optional[float]] = []
 
     n_no_gt = 0
     with open(args.infer_file, "r", encoding="utf-8") as f:
@@ -147,6 +350,7 @@ def main():
             labels.append(_normalize_gt_label(gt))
             messages.append(item.get("messages") or [])
             raw_records.append(item)
+            first_token_logprobs.append(_extract_first_answer_token_logprob(item))
             if not gt:
                 n_no_gt += 1
 
@@ -164,6 +368,21 @@ def main():
     n_format = sum(1 for r in fmt_rewards if r >= 0.5)
     acc = n_correct / n_total
     fmt_rate = n_format / n_total
+
+    # ---- Threshold sweep on the first answer-token confidence --------------
+    # confidence = exp(logprob_of_first_answer_token), in [0, 1].
+    # "first answer token" = first generated token after the empty
+    # `<think></think>` block (Qwen3 always emits one even with
+    # enable_thinking=false), see _extract_first_answer_token_logprob.
+    confidences: List[Optional[float]] = [_logprob_to_prob(lp) for lp in first_token_logprobs]
+    n_with_conf = sum(1 for c in confidences if c is not None)
+    correctness = [1 if r >= 0.5 else 0 for r in acc_rewards]
+    threshold_curve: List[Dict[str, float]] = []
+    best_point: Optional[Dict[str, float]] = None
+    if n_with_conf > 0:
+        thresholds = _build_threshold_grid()
+        threshold_curve, best_point = compute_threshold_curve(
+            correctness, confidences, thresholds)
 
     # Collect error samples for display.
     errors = []
@@ -193,6 +412,25 @@ def main():
     if n_no_gt:
         print(f"  WARN missing-gt samples: {n_no_gt} (counted as wrong)")
     print("=" * 60)
+
+    # Print the threshold sweep table.
+    if threshold_curve:
+        print("\n[Threshold sweep] (confidence = exp(first_answer_token_logprob), think block skipped)")
+        print(f"  samples with logprob: {n_with_conf}/{n_total}")
+        print(f"  {'threshold':>10s}  {'precision':>9s}  {'recall':>7s}  {'f1':>6s}  "
+              f"{'coverage':>8s}  {'accepted':>8s}  {'tp':>5s}  {'fp':>5s}")
+        for row in threshold_curve:
+            print(f"  {row['threshold']:>10.4f}  {row['precision']:>9.4f}  "
+                  f"{row['recall']:>7.4f}  {row['f1']:>6.4f}  "
+                  f"{row['coverage']:>8.4f}  {row['accepted']:>8d}  "
+                  f"{row['tp']:>5d}  {row['fp']:>5d}")
+        if best_point is not None:
+            print(f"\n  >> best-F1 @ threshold={best_point['threshold']:.4f}: "
+                  f"P={best_point['precision']:.4f}  R={best_point['recall']:.4f}  "
+                  f"F1={best_point['f1']:.4f}  coverage={best_point['coverage']:.4f}")
+    else:
+        print("\n[Threshold sweep] skipped: no first-token logprob found in infer file.")
+        print("  -> rerun infer with `--logprobs true --top_logprobs 3` (see infer_event_qwen3.sh)")
     if errors:
         print("\n[Sample errors]")
         for i, e in enumerate(errors, 1):
@@ -210,6 +448,9 @@ def main():
                     "accuracy": acc,
                     "format_rate": fmt_rate,
                     "missing_gt": n_no_gt,
+                    "samples_with_logprob": n_with_conf,
+                    "threshold_curve": threshold_curve,
+                    "best_f1": best_point,
                 },
                 f,
                 ensure_ascii=False,

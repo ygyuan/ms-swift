@@ -1,21 +1,26 @@
 #!/bin/bash
-# One-click: run inference on the event-classification test set, then
+# One-click: run inference on the event-classification test set using a
+# GKD-distilled checkpoint (teacher: Qwen3-14B, student: Qwen3-1.7B), then
 # evaluate accuracy / format-rate using EventAccuracy / EventFormat ORMs.
 #
 # Usage:
-#   bash project/scripts/eval_event_qwen3.sh
-#   CKPT=/path/to/checkpoint-xxx bash project/scripts/eval_event_qwen3.sh
-#   TEST_JSONL=/path/to/test.jsonl bash project/scripts/eval_event_qwen3.sh
-#   SKIP_INFER=1 bash project/scripts/eval_event_qwen3.sh   # reuse cached infer
+#   bash project/scripts/eval_event_qwen3_gkd.sh
+#   CKPT=/path/to/checkpoint-xxx bash project/scripts/eval_event_qwen3_gkd.sh
+#   TEST_JSONL=/path/to/test.jsonl bash project/scripts/eval_event_qwen3_gkd.sh
+#   SKIP_INFER=1 bash project/scripts/eval_event_qwen3_gkd.sh   # reuse cached infer
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3-1.7B/event/v1/v2-20260603-172851/checkpoint-3000}"
+# Default checkpoint -> GKD training output dir from train_event_qwen3_gkd.sh.
+# Override CKPT to point at the actual checkpoint-N folder of your run.
+export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3-1.7B/event/gkd_v1/v3-20260609-162429/checkpoint-321}"
 # Held-out alpaca-style jsonl with fields {instruction,input,output,label,...}.
-# Defaults to the training jsonl for convenience; override with your own test set.
+# Defaults to the held-out test jsonl; override with your own test set.
 export TEST_JSONL="${TEST_JSONL:-/apdcephfs_qy3/share_301069248/data/video/event_rag/merge/test_ayden_v1.jsonl}"
-export OUT_FILE="${OUT_FILE:-${CKPT}/infer_event.jsonl}"
+# Use GKD-specific filenames so this script does NOT collide with the GRPO
+# evaluation outputs in eval_event_qwen3.sh when both share the same CKPT dir.
+export OUT_FILE="${OUT_FILE:-${CKPT}/infer_event_gkd.jsonl}"
 export GPU="${GPU:-0,1,2,3,4,5}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 export TEMPERATURE="${TEMPERATURE:-0.0}"
@@ -28,21 +33,17 @@ export MODEL_TYPE="${MODEL_TYPE:-qwen3}"
 # (candidates may include qwen3 / qwen3_thinking / qwen3_nothinking /
 #  deepseek_r1 / qwen3_guard / yufeng_xguard).
 # `qwen3` is a mixed thinking template; with ENABLE_THINKING=false below
-# this matches the training-time configuration.
+# this matches the training-time configuration of train_event_qwen3_gkd.sh.
 export TEMPLATE="${TEMPLATE:-qwen3}"
 # Match training (`--enable_thinking false`) so the model does not emit
 # <think>...</think> blocks during evaluation.
 export ENABLE_THINKING="${ENABLE_THINKING:-false}"
 # Strip the empty `<think>\n\n</think>\n\n` block that Qwen3's chat template
 # would otherwise inject as the assistant response prefix even when
-# enable_thinking=false. This matches the training scripts that pass
+# enable_thinking=false. Matches the training script which also passes
 # `--response_prefix ''`, ensuring train/inference prompt parity.
 export STRIP_THINK_PREFIX="${STRIP_THINK_PREFIX:-true}"
-# Emit first-generated-token logprobs so that eval_event.py can compute
-# precision/recall/F1 vs threshold curves using exp(logprob) as confidence.
-export LOGPROBS="${LOGPROBS:-true}"
-export TOP_LOGPROBS="${TOP_LOGPROBS:-3}"
-REPORT="${REPORT:-${CKPT}/eval_event_report.json}"
+REPORT="${REPORT:-${CKPT}/eval_event_gkd_report.json}"
 
 # 1) inference (skip if cached and SKIP_INFER=1)
 if [ "${SKIP_INFER:-0}" != "1" ]; then
