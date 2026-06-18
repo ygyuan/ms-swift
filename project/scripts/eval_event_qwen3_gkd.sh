@@ -14,7 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default checkpoint -> GKD training output dir from train_event_qwen3_gkd.sh.
 # Override CKPT to point at the actual checkpoint-N folder of your run.
-export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3-1.7B/event/gkd_v1/v3-20260609-162429/checkpoint-321}"
+export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3-1.7B/event/gkd_v3/v0-20260615-191433/checkpoint-1446}"
 # Held-out alpaca-style jsonl with fields {instruction,input,output,label,...}.
 # Defaults to the held-out test jsonl; override with your own test set.
 export TEST_JSONL="${TEST_JSONL:-/apdcephfs_qy3/share_301069248/data/video/event_rag/merge/test_ayden_v1.jsonl}"

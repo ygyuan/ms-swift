@@ -7,6 +7,7 @@ import torch.nn as nn
 from contextlib import contextmanager, nullcontext
 from megatron.core import mpu
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.tensor_parallel import VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     gather_from_tensor_model_parallel_region)
@@ -243,7 +244,7 @@ def test_convert_precision(args, hf_model, mg_model, template, test_convert_dtyp
         mg_inputs['packed_seq_params'] = get_packed_seq_params(text_position_ids)
     mg_language_model.config.fp8 = None  # compat fp8
     mg_modules = _find_modules(mg_language_model, ignore_modules=['visual'])
-    for key in ['labels', 'num_samples', 'attention_mask_2d']:
+    for key in ['labels', 'seq_lens', 'attention_mask_2d']:
         mg_inputs.pop(key, None)
     mg_inputs = get_batch_on_this_cp_rank(args, mg_inputs)
     _param = next(mg_language_model.parameters())
@@ -267,7 +268,6 @@ def test_convert_precision(args, hf_model, mg_model, template, test_convert_dtyp
             if mg_logits is not None:
                 mg_logits = gather_from_tensor_model_parallel_region(mg_logits)
         if args.context_parallel_size > 1:
-            from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
             if mg_logits is not None:
                 mg_logits = gather_from_sequence_parallel_region(
                     mg_logits.transpose(0, 1), group=mpu.get_context_parallel_group())

@@ -440,7 +440,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     apply_rope_fusion: bool = False
     gradient_accumulation_fusion: bool = True
     cross_entropy_loss_fusion: bool = True
-    cross_entropy_fusion_impl: Optional[Literal['native', 'te']] = None
+    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
     calculate_per_token_loss: Optional[bool] = None
     attention_backend: str = 'flash'  # flash, fused, unfused, local, auto
     optimizer: Literal['adam', 'sgd', 'muon', 'dist_muon'] = 'adam'
@@ -497,6 +497,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     muon_use_nesterov: bool = False
     muon_scale_mode: Literal['spectral', 'unit_rms_norm', 'shape_scaling'] = 'spectral'
     muon_fp32_matmul_prec: Literal['low', 'medium', 'high'] = 'medium'
+    muon_coefficient_type: str = 'quintic'
     muon_num_ns_steps: int = 5
     muon_tp_mode: Literal['blockwise', 'duplicated', 'distributed'] = 'blockwise'
     muon_extra_scale_factor: float = 1.
@@ -648,6 +649,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = None
     num_labels: Optional[int] = None
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None
+    # embedding (Matryoshka Representation Learning)
+    # Dict[int, float], where the key is the embedding dimension and the value is the corresponding loss weight,
+    # e.g. '{"32": 1.0, "64": 1.0, "128": 1.0}'.
+    mrl_dims: Optional[Union[dict, str]] = None
     save_strategy: Literal['steps', 'epoch'] = 'steps'
     callbacks: List[str] = field(default_factory=list)
 
@@ -672,11 +677,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         return res
 
     def _set_default(self):
-        if self.mlp_padding_free:
-            if self.context_parallel_size > 1:
-                require_version(
-                    'mcore-bridge>=1.4.0.dev',
-                    'Please install mcore-bridge>=1.4.0.dev to use mlp_padding_free with context parallel.')
         if self.local_rank is None:
             self.local_rank = get_dist_setting()[1]
         if self.lr is None:
@@ -721,15 +721,6 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
         self._init_vpp_size()
         if self.vit_gradient_checkpointing is None:
             self.vit_gradient_checkpointing = not self.freeze_vit
-        if self.cross_entropy_fusion_impl is None:
-            if is_torch_npu_available():
-                self.cross_entropy_fusion_impl = 'native'
-            else:
-                import transformer_engine
-                if version.parse(transformer_engine.__version__) >= version.parse('2.8.0'):
-                    self.cross_entropy_fusion_impl = 'te'
-                else:
-                    self.cross_entropy_fusion_impl = 'native'
         if isinstance(self.report_to, str):
             self.report_to = [self.report_to]
         self.model_info, self.model_meta = get_model_info_meta(
@@ -755,6 +746,9 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
 
         if self.megatron_extra_kwargs is not None:
             self.megatron_extra_kwargs = json_parse_to_dict(self.megatron_extra_kwargs)
+        if self.mrl_dims is not None:
+            self.mrl_dims = json_parse_to_dict(self.mrl_dims)
+            self.mrl_dims = {int(k): float(v) for k, v in self.mrl_dims.items()}
         if self.task_type not in {'causal_lm', 'generative_reranker'}:
             self.untie_embeddings_and_output_weights = True
         if self.vit_gradient_checkpointing_kwargs is not None:

@@ -1,7 +1,7 @@
 import os
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-
+os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0'
 kwargs = {
     'per_device_train_batch_size': 2,
     'per_device_eval_batch_size': 2,
@@ -13,6 +13,7 @@ kwargs = {
 
 def test_llm_ddp():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import InferArguments, SftArguments, infer_main, sft_main
     result = sft_main(
         SftArguments(
@@ -47,6 +48,7 @@ def test_unsloth():
 def test_mllm_mp():
     os.environ['MAX_PIXELS'] = '100352'
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1,2,3'
     from swift import InferArguments, SftArguments, infer_main, sft_main
     result = sft_main(
         SftArguments(
@@ -87,6 +89,7 @@ def test_mllm_streaming():
 
 def test_mllm_zero3():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import SftArguments, sft_main
     sft_main(
         SftArguments(
@@ -99,6 +102,7 @@ def test_mllm_zero3():
 
 def test_qwen_vl():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import SftArguments, sft_main
     sft_main(
         SftArguments(
@@ -110,6 +114,7 @@ def test_qwen_vl():
 
 def test_qwen2_audio():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import SftArguments, sft_main
     sft_main(
         SftArguments(
@@ -148,6 +153,7 @@ def test_llm_awq():
 
 def test_mllm_streaming_zero3():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import SftArguments, sft_main
     sft_main(
         SftArguments(
@@ -161,6 +167,7 @@ def test_mllm_streaming_zero3():
 
 def test_mllm_streaming_mp_ddp():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1,2,3'
     from swift import SftArguments, sft_main
     sft_main(
         SftArguments(
@@ -263,6 +270,7 @@ def test_resume_only_model():
 
 def test_llm_transformers_4_33():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import SftArguments, sft_main
     sft_main(
         SftArguments(
@@ -275,6 +283,7 @@ def test_llm_transformers_4_33():
 def test_predict_with_generate():
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import SftArguments, sft_main
 
     # 'modelscope/coco_2014_caption:validation#100',
@@ -294,6 +303,7 @@ def test_predict_with_generate():
 def test_predict_with_generate_zero3():
     import os
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import SftArguments, sft_main
 
     # 'modelscope/coco_2014_caption:validation#100',
@@ -326,7 +336,8 @@ def test_template():
 
 
 def test_emu3_gen():
-    os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0'
     os.environ['max_position_embeddings'] = '10240'
     os.environ['image_area'] = '518400'
     from swift import InferArguments, SftArguments, infer_main, sft_main
@@ -346,6 +357,7 @@ def test_emu3_gen():
 
 def test_eval_strategy():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import InferArguments, SftArguments, infer_main, sft_main
     result = sft_main(
         SftArguments(
@@ -360,6 +372,7 @@ def test_eval_strategy():
 
 def test_epoch():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import InferArguments, SftArguments, infer_main, sft_main
 
     train_kwargs = kwargs.copy()
@@ -378,6 +391,7 @@ def test_epoch():
 
 def test_agent():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import InferArguments, SftArguments, infer_main, sft_main
 
     result = sft_main(
@@ -394,6 +408,7 @@ def test_agent():
 
 def test_grounding():
     os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+    os.environ['ASCEND_RT_VISIBLE_DEVICES'] = '0,1'
     from swift import InferArguments, SftArguments, infer_main, sft_main
 
     result = sft_main(
@@ -405,6 +420,53 @@ def test_grounding():
             **kwargs))
     last_model_checkpoint = result['last_model_checkpoint']
     infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True, stream=True, max_new_tokens=2048))
+
+
+def test_lora_sft_minimal():
+    from swift import InferArguments, SftArguments, infer_main, sft_main
+    result = sft_main(
+        SftArguments(
+            model='Qwen/Qwen2-0.5B',
+            dataset=['AI-ModelScope/alpaca-gpt4-data-zh#20'],
+            max_steps=2,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            save_steps=2,
+            split_dataset_ratio=0.01,
+            tuner_type='lora',
+            logging_steps=1,
+            **{
+                k: v
+                for k, v in kwargs.items() if k not in [
+                    'per_device_train_batch_size', 'save_steps', 'gradient_accumulation_steps', 'num_train_epochs',
+                    'per_device_eval_batch_size'
+                ]
+            }))
+    last_model_checkpoint = result['last_model_checkpoint']
+    infer_main(InferArguments(adapters=last_model_checkpoint, load_data_args=True))
+
+
+def test_full_sft_minimal():
+    from swift import SftArguments, sft_main
+    result = sft_main(
+        SftArguments(
+            model='Qwen/Qwen2-0.5B',
+            dataset=['AI-ModelScope/alpaca-gpt4-data-zh#20'],
+            max_steps=1,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=1,
+            save_steps=1,
+            split_dataset_ratio=0.01,
+            tuner_type='full',
+            logging_steps=1,
+            **{
+                k: v
+                for k, v in kwargs.items() if k not in [
+                    'per_device_train_batch_size', 'save_steps', 'gradient_accumulation_steps', 'num_train_epochs',
+                    'per_device_eval_batch_size'
+                ]
+            }))
+    assert os.path.isdir(result['last_model_checkpoint'])
 
 
 if __name__ == '__main__':
@@ -434,3 +496,5 @@ if __name__ == '__main__':
     # test_epoch()
     # test_agent()
     # test_grounding()
+    # test_lora_sft_minimal()
+    # test_full_sft_minimal()

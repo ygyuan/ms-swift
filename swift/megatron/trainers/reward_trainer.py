@@ -11,16 +11,12 @@ logger = get_logger()
 
 class MegatronRewardTrainer(MegatronRLHFTrainer):
 
-    def __init__(self, args, template):
-        super().__init__(args, template)
-        assert args.context_parallel_size == 1, 'Currently `rlhf_type="rm"` does not support context parallelism.'
-
     def loss_func(self, output_tensor, *, data):
         packed_seq_params = data.get('packed_seq_params')
         margin = data.pop('margin', None)
-        num_samples = output_tensor.shape[0] // 2 if packed_seq_params is None else packed_seq_params.num_samples
-        rewards = self.get_last_tokens(output_tensor, packed_seq_params, data.get('attention_mask'), 2 * num_samples)
-        rewards_chosen, rewards_rejected = torch.split(rewards, num_samples, dim=0)
+        num_samples = output_tensor.shape[0] if packed_seq_params is None else packed_seq_params.seq_lens.shape[0]
+        rewards = self.get_last_tokens(output_tensor, packed_seq_params, data.get('attention_mask'))
+        rewards_chosen, rewards_rejected = torch.split(rewards, num_samples // 2, dim=0)
         if margin is not None:
             loss = -nn.functional.logsigmoid(rewards_chosen - rewards_rejected - margin).mean()
         else:
@@ -43,7 +39,6 @@ class MegatronRewardTrainer(MegatronRLHFTrainer):
         return loss, metric
 
     def forward_step(self, data_iterator, model):
-        # Get the batch.
         vp_stage = model.module.module.vp_stage
         data = self.get_batch(data_iterator, vp_stage)
         data.pop('loss_scale', None)

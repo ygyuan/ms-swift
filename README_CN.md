@@ -73,6 +73,7 @@
 - **模型量化**：支持AWQ、GPTQ、FP8和BNB的量化导出，导出的模型支持使用vLLM/SGLang/LmDeploy推理加速。
 
 ## 🎉 新闻
+- 🎁 2026.06.10: Megatron-Ray支持GRPO和GKD训练，查看[文档](docs/source/Instruction/Ray.md)和[示例](examples/ray)。
 - 🎁 2026.03.03: **ms-swift v4.0**大版本正式发布，release note参考[这里](https://github.com/modelscope/ms-swift/releases/tag/v4.0.0)，您的建议可以在[这个issue](https://github.com/modelscope/ms-swift/issues/7250)中反馈给我们，感谢您的支持。
 - 🎁 2025.11.14: Megatron GRPO现已支持！查看[文档](./docs/source/Megatron-SWIFT/GRPO.md)和[示例](examples/megatron/grpo)。
 - 🎁 2025.11.04: 支持[Mcore-Bridge](docs/source/Megatron-SWIFT/Mcore-Bridge.md)，使Megatron训练像transformers一样简单易用。
@@ -137,14 +138,14 @@ uv pip install -e . --torch-backend=auto
 | python       | >=3.10        | 3.12            |                    |
 | cuda         |              | cuda12.8/13.0       | 使用cpu、npu、mps则无需安装 |
 | torch        | >=2.0        | 2.8.0/2.11.0         |                    |
-| transformers | >=4.33       | 4.57.6/5.8.1        |                    |
+| transformers | >=4.33       | 4.57.6/5.12.1        |                    |
 | modelscope   | >=1.23       |                     |                    |
 | datasets     | >=3.0,<4.8.5 | 3.6.0/4.8.4         |                    |
 | peft         | >=0.11,<0.20 |                     |                    |
 | flash_attn   |              | 2.8.3/4.0.0b15 |                    |
 | trl          | >=0.15,<1.0 | 0.29.1              | RLHF               |
 | deepspeed    | >=0.14       | 0.18.9              | 训练                 |
-| vllm         | >=0.5.1      | 0.11.0/0.21.0        | 推理/部署              |
+| vllm         | >=0.5.1      | 0.11.0/0.23.0        | 推理/部署              |
 | sglang       | >=0.4.6      |          | 推理/部署              |
 | evalscope    | >=1.0       |                     | 评测                 |
 | gradio       |              | 5.32.1              | Web-UI/App         |

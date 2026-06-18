@@ -43,8 +43,8 @@ from .utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedT
                     add_base_layer_suffix_by_param_names, aggressive_empty_cache, check_vllm_version_ge,
                     expand_vllm_param_name_aliases, finish_vllm_weight_reload, get_even_process_data,
                     get_gather_if_zero3_context, patch_lora_merge, patch_lora_unmerge, patch_vllm_load_adapter,
-                    patch_vllm_moe_model_weight_loader, profiling_context, profiling_decorator, set_expandable_segments,
-                    vllm_supports_lora_load_inplace)
+                    patch_vllm_moe_model_weight_loader, profiling_context, profiling_decorator,
+                    revert_runtime_names_to_checkpoint, set_expandable_segments, vllm_supports_lora_load_inplace)
 
 DataType = List[Dict[str, Union[torch.Tensor, Any]]]
 logger = get_logger()
@@ -575,15 +575,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     self.vllm_client.update_named_param(name, param)
         elif self.vllm_mode == 'colocate':
             llm_model = self.engine.inner_model
-            # Patch MoE weight_loader if needed
-            patch_vllm_moe_model_weight_loader(llm_model)
-            # Re-run process_weights_after_loading on FusedMoE layers so
-            # the kernel-format layout is rebuilt after the in-place reload
-            # (workaround for vLLM issue #42821).
-            try:
-                llm_model.load_weights(state_dict.items())
-            finally:
-                finish_vllm_weight_reload(llm_model)
+            llm_model.load_weights(state_dict.items())
         del state_dict
 
     def _fix_param_name_to_vllm(self, name: str, extra_prefixes: Optional[List[str]] = None) -> str:
@@ -776,6 +768,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         if is_peft:
             assert len(state_dict) > 0 and all([state.shape != torch.Size([0]) for state in state_dict.values()])
 
+        # Revert transformers runtime param names back to checkpoint names so vLLM's
+        # hf_to_vllm_mapper (built for checkpoint names) maps them correctly. Fixes
+        # online weight sync for models like gemma4_unified where runtime names differ
+        # from checkpoint names (transformers>=5 conversion mapping). No-op otherwise.
+        state_dict = revert_runtime_names_to_checkpoint(self.accelerator.unwrap_model(self.model), state_dict)
+
         return state_dict
 
     def _move_full_model_to_vllm(self):
@@ -790,6 +788,10 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         should_merge = is_peft and not self._is_fsdp2 and not self.rollout_enable_lora
 
         gather_if_zero3 = get_gather_if_zero3_context(self)
+
+        # Colocate: patch MoE weight_loader once before loading all groups
+        if self.vllm_mode == 'colocate':
+            patch_vllm_moe_model_weight_loader(self.engine.inner_model)
 
         for i, parameter_group in enumerate(self.parameter_groups):
             parameter_group_no_lora = self.parameter_groups_no_lora[i]
@@ -814,6 +816,14 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     if should_merge:
                         with patch_lora_unmerge(self.model):
                             self.model.unmerge_adapter()
+
+        # Re-run process_weights_after_loading once after ALL groups loaded
+        if self.vllm_mode == 'colocate':
+            _model_config = self.engine.engine.model_config
+            llm_model = self.engine.inner_model
+            finish_vllm_weight_reload(llm_model, model_config=_model_config, target_device=self.accelerator.device)
+        elif self.vllm_mode == 'server' and self.accelerator.is_main_process:
+            self.vllm_client.process_weights_after_loading()
 
         if is_peft:
             self.base_sync_done = True

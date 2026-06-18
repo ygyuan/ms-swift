@@ -15,9 +15,10 @@ export PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True'
 # checkpoint-321 as a fresh starting model and run 9 more epochs with a new
 # cosine schedule. Learning rate is reduced to avoid destroying learned weights.
 MODEL_PATH=/apdcephfs_qy3/share_301069248/huggingface/OperableTextEventFt_v9
-TEACHER_MODEL_PATH=/apdcephfs_qy3/share_301069248/huggingface/OperableTextEventFt_4b/checkpoint-4932
+# TEACHER_MODEL_PATH=/apdcephfs_qy3/share_301069248/huggingface/OperableTextEventFt_4b/checkpoint-4932
+TEACHER_MODEL_PATH=/apdcephfs_qy3/share_301069248/huggingface/OperableTextEventFt_8b/checkpoint-8200
 DATASET_PATH=/apdcephfs_qy3/share_301069248/data/video/event_rag/merge/train_ayden_v1.jsonl
-OUTPUT_DIR=/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3-1.7B/event/gkd_v3
+OUTPUT_DIR=/apdcephfs_qy3/share_301069248/users/yougenyuan/software/github/ms-swift/output/Qwen3-1.7B/event/gkd_v4
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 NPROC_PER_NODE=8 \

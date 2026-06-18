@@ -2,7 +2,7 @@
 # sh requirements/install_all.sh
 # pip install sglang -U
 pip install "vllm>=0.5.1" -U
-pip install "transformers<5.10" "trl<1.0" "peft<0.20" "datasets<4.8.5" -U
+pip install "transformers<5.13" "trl<1.0" "peft<0.20" "datasets<4.8.5" -U
 pip install optimum bitsandbytes "gradio<5.33" mcore-bridge -U
 pip install "ms-swift[all]@git+https://github.com/modelscope/ms-swift.git"
 pip install timm "deepspeed<0.19" ray -U
@@ -16,5 +16,5 @@ pip install git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3 --no-bu
 pip install -U flash-linear-attention --no-build-isolation
 pip install -U git+https://github.com/Dao-AILab/causal-conv1d --no-build-isolation
 pip install git+https://github.com/Dao-AILab/fast-hadamard-transform --no-build-isolation
-pip install git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0
+pip install git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0
 # apex
