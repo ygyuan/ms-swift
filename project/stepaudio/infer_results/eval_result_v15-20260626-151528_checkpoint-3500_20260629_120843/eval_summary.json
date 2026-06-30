@@ -1,0 +1,412 @@
+{
+  "args": {
+    "result_path": "/apdcephfs_qy3/share_301069248/users/yougenyuan/workspace/github/ms-swift/project/stepaudio/infer_results/result_v15-20260626-151528_checkpoint-3500_20260629_120843.jsonl",
+    "val_jsonl": "/apdcephfs_qy3/share_301069248/users/yougenyuan/workspace/github/ms-swift/project/stepaudio/data/val.jsonl",
+    "classes": "speech,music,noise,porn,song",
+    "target_class": "porn",
+    "thresholds": "",
+    "output_dir": "/apdcephfs_qy3/share_301069248/users/yougenyuan/workspace/github/ms-swift/project/stepaudio/infer_results/eval_result_v15-20260626-151528_checkpoint-3500_20260629_120843",
+    "max_print_rows": 21
+  },
+  "classes": [
+    "speech",
+    "music",
+    "noise",
+    "porn",
+    "song"
+  ],
+  "target_class": "porn",
+  "n_total_records": 6778,
+  "n_used": 6778,
+  "n_unknown_gt": 0,
+  "n_unknown_pred": 90,
+  "n_with_logprob": 6778,
+  "n_invalid_response": 90,
+  "invalid_response_by_gt": {
+    "porn": 27,
+    "speech": 62,
+    "music": 1
+  },
+  "invalid_response_samples": [
+    {
+      "row": 1,
+      "gt": "porn",
+      "response": "<tts_end>"
+    },
+    {
+      "row": 4,
+      "gt": "porn",
+      "response": "<tts_end>"
+    },
+    {
+      "row": 37,
+      "gt": "porn",
+      "response": "<tts_end>"
+    },
+    {
+      "row": 148,
+      "gt": "porn",
+      "response": "<tts_end><tts_end><tts_end><audio_3280><audio_4228><audio_4228><audio_4228><audio_4228>"
+    },
+    {
+      "row": 151,
+      "gt": "porn",
+      "response": "<tts_end><tts_end>"
+    },
+    {
+      "row": 156,
+      "gt": "porn",
+      "response": "<tts_end>"
+    },
+    {
+      "row": 211,
+      "gt": "porn",
+      "response": "<tts_end><tts_end><tts_end>"
+    },
+    {
+      "row": 212,
+      "gt": "porn",
+      "response": "<tts_end>"
+    },
+    {
+      "row": 214,
+      "gt": "porn",
+      "response": "<tts_end><tts_end><tts_end><tts_end>]"
+    },
+    {
+      "row": 216,
+      "gt": "porn",
+      "response": "<tts_end>"
+    }
+  ],
+  "multiclass_report": {
+    "accuracy": 0.31189141339628207,
+    "n_total": 6778,
+    "n_correct": 2114,
+    "per_class": {
+      "speech": {
+        "precision": 0.807914262159934,
+        "recall": 0.2087771623348956,
+        "f1": 0.33180971728457764,
+        "support": 4694,
+        "tp": 980,
+        "fp": 233,
+        "fn": 3714
+      },
+      "music": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 366,
+        "tp": 0,
+        "fp": 0,
+        "fn": 366
+      },
+      "noise": {
+        "precision": 0.20712328767123286,
+        "recall": 0.9973614775725593,
+        "f1": 0.3430127041742287,
+        "support": 1137,
+        "tp": 1134,
+        "fp": 4341,
+        "fn": 3
+      },
+      "porn": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 337,
+        "tp": 0,
+        "fp": 0,
+        "fn": 337
+      },
+      "song": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 244,
+        "tp": 0,
+        "fp": 0,
+        "fn": 244
+      }
+    },
+    "macro": {
+      "precision": 0.20300750996623335,
+      "recall": 0.241227727981491,
+      "f1": 0.13496448429176128
+    },
+    "weighted": {
+      "precision": 0.5942532789408265,
+      "recall": 0.31189141339628207,
+      "f1": 0.2873296337533056
+    },
+    "confusion": {
+      "speech": {
+        "noise": 3652,
+        "speech": 980,
+        "<other>": 62
+      },
+      "music": {
+        "noise": 321,
+        "speech": 44,
+        "<other>": 1
+      },
+      "noise": {
+        "noise": 1134,
+        "speech": 3
+      },
+      "porn": {
+        "noise": 216,
+        "<other>": 27,
+        "speech": 94
+      },
+      "song": {
+        "noise": 152,
+        "speech": 92
+      },
+      "<other>": {}
+    }
+  },
+  "threshold_sweep": [
+    {
+      "threshold": 0.05,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.1,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.15,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.2,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.25,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.3,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.35,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.4,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.45,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.5,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.55,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.6,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.65,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.7,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.75,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.8,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.85,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.9,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.95,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    }
+  ],
+  "best_threshold": {
+    "threshold": 0.0,
+    "tp": 337,
+    "fp": 6441,
+    "fn": 0,
+    "tn": 0,
+    "precision": 0.04971968132192387,
+    "recall": 1.0,
+    "f1": 0.09472944483485594,
+    "predicted_positive": 6778,
+    "actual_positive": 337
+  }
+}

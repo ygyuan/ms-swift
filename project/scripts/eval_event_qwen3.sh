@@ -16,7 +16,7 @@ export CKPT="${CKPT:-/apdcephfs_qy3/share_301069248/users/yougenyuan/software/gi
 # Defaults to the training jsonl for convenience; override with your own test set.
 export TEST_JSONL="${TEST_JSONL:-/apdcephfs_qy3/share_301069248/data/video/event_rag/merge/test_ayden_v1.jsonl}"
 export OUT_FILE="${OUT_FILE:-${CKPT}/infer_event.jsonl}"
-export GPU="${GPU:-0,1,2,3,4,5}"
+export GPU="${GPU:-0,1}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
 export TEMPERATURE="${TEMPERATURE:-0.0}"
 export BACKEND="${BACKEND:-pt}"

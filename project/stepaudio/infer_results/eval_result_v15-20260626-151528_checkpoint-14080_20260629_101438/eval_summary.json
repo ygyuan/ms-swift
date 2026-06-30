@@ -1,0 +1,360 @@
+{
+  "args": {
+    "result_path": "project/stepaudio/infer_results/result_v15-20260626-151528_checkpoint-14080_20260629_101438.jsonl",
+    "val_jsonl": "/apdcephfs_qy3/share_301069248/users/yougenyuan/workspace/github/ms-swift/project/stepaudio/data/val.jsonl",
+    "classes": "speech,music,noise,porn,song",
+    "target_class": "porn",
+    "thresholds": "",
+    "output_dir": "/apdcephfs_qy3/share_301069248/users/yougenyuan/workspace/github/ms-swift/project/stepaudio/infer_results/eval_result_v15-20260626-151528_checkpoint-14080_20260629_101438",
+    "max_print_rows": 21
+  },
+  "classes": [
+    "speech",
+    "music",
+    "noise",
+    "porn",
+    "song"
+  ],
+  "target_class": "porn",
+  "n_total_records": 6778,
+  "n_used": 6778,
+  "n_unknown_gt": 0,
+  "n_unknown_pred": 139,
+  "n_with_logprob": 6778,
+  "multiclass_report": {
+    "accuracy": 0.31956329300678665,
+    "n_total": 6778,
+    "n_correct": 2166,
+    "per_class": {
+      "speech": {
+        "precision": 0.8145224940805051,
+        "recall": 0.21985513421389008,
+        "f1": 0.346250629089079,
+        "support": 4694,
+        "tp": 1032,
+        "fp": 235,
+        "fn": 3662
+      },
+      "music": {
+        "precision": 0.014925373134328358,
+        "recall": 0.00546448087431694,
+        "f1": 0.007999999999999998,
+        "support": 366,
+        "tp": 2,
+        "fp": 132,
+        "fn": 364
+      },
+      "noise": {
+        "precision": 0.21611302023673157,
+        "recall": 0.9956024626209323,
+        "f1": 0.3551372549019608,
+        "support": 1137,
+        "tp": 1132,
+        "fp": 4106,
+        "fn": 5
+      },
+      "porn": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 337,
+        "tp": 0,
+        "fp": 0,
+        "fn": 337
+      },
+      "song": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0,
+        "support": 244,
+        "tp": 0,
+        "fp": 0,
+        "fn": 244
+      }
+    },
+    "macro": {
+      "precision": 0.20911217749031302,
+      "recall": 0.24418441554182788,
+      "f1": 0.14187757679820795
+    },
+    "weighted": {
+      "precision": 0.601143667422576,
+      "recall": 0.31956329300678665,
+      "f1": 0.2997963280861119
+    },
+    "confusion": {
+      "speech": {
+        "noise": 3452,
+        "speech": 1032,
+        "<other>": 94,
+        "music": 116
+      },
+      "music": {
+        "noise": 314,
+        "speech": 46,
+        "<other>": 4,
+        "music": 2
+      },
+      "noise": {
+        "noise": 1132,
+        "speech": 3,
+        "music": 2
+      },
+      "porn": {
+        "noise": 204,
+        "<other>": 37,
+        "speech": 89,
+        "music": 7
+      },
+      "song": {
+        "noise": 136,
+        "speech": 97,
+        "music": 7,
+        "<other>": 4
+      },
+      "<other>": {}
+    }
+  },
+  "threshold_sweep": [
+    {
+      "threshold": 0.05,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.1,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.15,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.2,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.25,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.3,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.35,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.4,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.45,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.5,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.55,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.6,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.65,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.7,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.75,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.8,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.85,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.9,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    },
+    {
+      "threshold": 0.95,
+      "tp": 0,
+      "fp": 0,
+      "fn": 337,
+      "tn": 6441,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "predicted_positive": 0,
+      "actual_positive": 337
+    }
+  ],
+  "best_threshold": {
+    "threshold": 0.0,
+    "tp": 337,
+    "fp": 6441,
+    "fn": 0,
+    "tn": 0,
+    "precision": 0.04971968132192387,
+    "recall": 1.0,
+    "f1": 0.09472944483485594,
+    "predicted_positive": 6778,
+    "actual_positive": 337
+  }
+}
