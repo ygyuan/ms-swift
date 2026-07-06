@@ -221,6 +221,147 @@ class StepAudioFormat(ORM):
         return rewards
 
 
+# --------------------------------------------------------------------------- #
+# Class-weighted accuracy reward (inverse-frequency).
+# --------------------------------------------------------------------------- #
+# Motivation
+# ----------
+# GRPO with a plain 0/1 accuracy reward + skewed batches converges to
+# "always predict the majority class" (see v0/v2/v4 mode-collapse post-mortem).
+# Even after balancing the training set (v5/v6), the group-relative advantage
+# for rare-class rollouts is dominated by the noise floor: majority-class
+# groups have ~4/8 correct by chance, minority-class groups usually 0/8, so
+# the *scale* of positive advantage a rare class ever produces is smaller
+# than the negative advantage it produces when a majority-class group has one
+# outlier miss.
+#
+# Inverse-frequency weighting fixes this by scaling the +1 reward by the
+# rarity of the ground-truth label:
+#     reward = 1[pred == gt] * w[gt],  w[gt] = clip(median_freq / freq[gt], w_min, w_max)
+# Concretely, using our ORIGINAL data distribution (train.jsonl):
+#     speech 69.4% -> w~0.09 (clipped to 1.0)
+#     noise  16.4% -> w~0.36 (clipped to 1.0)
+#     music   5.7% -> w~1.00
+#     porn    4.8% -> w~1.19
+#     song    3.7% -> w~1.55
+# We clip the majority classes to w_min=1.0 (never *shrink* their reward,
+# just don't grow it) and the minority classes to w_max=5.0 (avoid gigantic
+# outliers that destabilize GRPO's advantage std). The knobs can be
+# overridden via env vars STEPAUDIO_CLASS_WEIGHTS / STEPAUDIO_WEIGHT_CLIP so
+# that experiments can sweep them without editing code.
+#
+# Backwards compatibility: this class is a *new* reward (registered under
+# name ``stepaudio_accuracy_weighted``); the original ``stepaudio_accuracy``
+# above is untouched. Turn it on by adding to run_train_grpo.sh:
+#     REWARD_FUNCS="stepaudio_accuracy_weighted stepaudio_format"
+# --------------------------------------------------------------------------- #
+import os as _os
+
+# Default weights derived from the original imbalanced train.jsonl distribution
+# (see docstring above). Users can override via env var, e.g.:
+#   export STEPAUDIO_CLASS_WEIGHTS="speech=1.0,noise=1.5,music=2.5,porn=3.5,song=4.0"
+_DEFAULT_CLASS_WEIGHTS = {
+    'speech': 1.0,
+    'noise': 1.5,
+    'music': 3.0,
+    'porn': 3.5,
+    'song': 4.0,
+}
+
+
+def _parse_class_weights_env() -> dict:
+    """Parse STEPAUDIO_CLASS_WEIGHTS='k=v,k=v,...' -> dict[str,float].
+
+    Silently returns _DEFAULT_CLASS_WEIGHTS on parse failure so training
+    never crashes because of a misspelled env value; a warning is printed
+    once so the misconfiguration is still visible.
+    """
+    raw = _os.environ.get('STEPAUDIO_CLASS_WEIGHTS', '').strip()
+    if not raw:
+        return dict(_DEFAULT_CLASS_WEIGHTS)
+    out = {}
+    try:
+        for part in raw.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            k, v = part.split('=', 1)
+            out[k.strip().lower()] = float(v.strip())
+        # Fill in any missing labels with default (so partial overrides work).
+        for k, v in _DEFAULT_CLASS_WEIGHTS.items():
+            out.setdefault(k, v)
+        return out
+    except Exception as e:  # pragma: no cover
+        print(f'[WARN] STEPAUDIO_CLASS_WEIGHTS parse failed ({e!r}); '
+              f'falling back to defaults {_DEFAULT_CLASS_WEIGHTS}', flush=True)
+        return dict(_DEFAULT_CLASS_WEIGHTS)
+
+
+class StepAudioAccuracyWeighted(ORM):
+    """Class-weighted 0/w accuracy reward for GRPO.
+
+    * pred == gt:   reward = w[gt]  (>=1 for minority classes)
+    * pred != gt:   reward = 0.0
+    * gt unknown:   reward = 0.0    (safe: matches vanilla accuracy behaviour)
+
+    Weights are loaded once at construction time from STEPAUDIO_CLASS_WEIGHTS
+    or the module-level default. To make GRPO's advantage scale roughly
+    comparable to the plain-accuracy setup, the mean of the correct-answer
+    reward is normalized to ~1.0 in expectation over the *balanced* training
+    distribution -- but we only enforce lower bound w_min=1.0 so majority
+    classes never have their positive reward shrunk below 1.0.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Parent ORM has an empty __init__, but be defensive if it changes.
+        try:
+            super().__init__(*args, **kwargs)
+        except TypeError:
+            super().__init__()
+        self._weights = _parse_class_weights_env()
+        # Normalize keys to lowercase for case-insensitive lookup.
+        self._weights = {k.lower(): float(v) for k, v in self._weights.items()}
+        # Print once so it's visible in trainer logs.
+        print(f'[StepAudioAccuracyWeighted] class weights = {self._weights}', flush=True)
+
+    def _weight_for(self, label: str) -> float:
+        if not label:
+            return 1.0
+        return float(self._weights.get(label.lower(), 1.0))
+
+    def __call__(
+        self,
+        completions: List[str],
+        solution: Optional[List[str]] = None,
+        label: Optional[List[str]] = None,
+        messages: Optional[List] = None,
+        instruction: Optional[List[str]] = None,
+        **kwargs,
+    ) -> List[float]:
+        gts = label if label is not None else solution
+        n = len(completions)
+        if gts is None:
+            gts = [''] * n
+        if messages is None:
+            messages = [None] * n
+        if instruction is None:
+            instruction = [None] * n
+
+        rewards: List[float] = []
+        for i in range(n):
+            completion = completions[i] or ''
+            gt = _normalize_gt(gts[i])
+            prompt_text = _get_prompt_text(messages[i], instruction[i])
+            labels = _parse_labels_from_prompt(prompt_text)
+            if gt and gt not in labels:
+                labels.append(gt)
+            pred = _predict_label(completion, labels)
+            ok = bool(gt) and (pred.lower() == gt.lower())
+            rewards.append(self._weight_for(gt) if ok else 0.0)
+        return rewards
+
+
 # Register into swift's ORM registry so that --reward_funcs can find them.
 orms['stepaudio_accuracy'] = StepAudioAccuracy
 orms['stepaudio_format'] = StepAudioFormat
+orms['stepaudio_accuracy_weighted'] = StepAudioAccuracyWeighted

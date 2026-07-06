@@ -403,6 +403,19 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         self._logs['prompt'].extend(self._apply_chat_template_to_messages_list(valid_messages))
         self._logs['completion'].extend(valid_completions)
 
+    # OPSD teacher-side extra length budget over the student-side max_length.
+    # Rationale: the teacher input equals the student's user_content + a short
+    # `hint` (typically 30-150 tokens). A sample that just fits the student's
+    # `total_length = template.max_length + max_completion_length` will still
+    # overflow the same budget on the teacher side and raise MaxLengthError.
+    # Granting the teacher an extra +256 tokens (>> typical hint length) lets
+    # such rows encode successfully without touching the student-side budget
+    # or dropping data. Only the teacher-side context uses this buffer; the
+    # student-side encoding remains at exactly `total_length`, so the student
+    # and teacher share the same assistant response and thus the same label
+    # count (required by extract_active in gkd_loss).
+    _OPSD_TEACHER_LENGTH_BUFFER = 256
+
     def _build_encoded_inputs(self,
                               model: nn.Module,
                               inputs: DataType,
@@ -494,10 +507,89 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
 
             else:
                 # Off-policy: use dataset responses, encode full messages
-                assert teacher_data is None, 'OPSD teacher data is not supported for off-policy mode'
                 total_length = self.template.max_length + self.max_completion_length
+                teacher_total_length = total_length + self._OPSD_TEACHER_LENGTH_BUFFER
+
+                # Filter out over-long rows before encoding: replace any row
+                # whose (prompt-only) encoding exceeds template.max_length by
+                # a fresh sample from the resample iterator. This mirrors what
+                # the STUDENT branch does and prevents MaxLengthError from
+                # crashing the training step under `truncation_strategy=delete`
+                # (which maps to `raise` inside the template).
+                if self.template.truncation_strategy == 'raise':
+                    inputs = self.resample_encode_failed_inputs(inputs)
+                    # inputs may have been swapped, rebuild the OPSD teacher
+                    # entries so student/teacher stay row-aligned.
+                    teacher_data = self._build_opsd_teacher_data(inputs)
+
+                # Student side: encode with the standard `total_length` budget.
                 with self._template_context(self.template, max_length=total_length):
                     encoded_inputs = self._prepare_batch_inputs(inputs, encode_prompt_only=False)
+
+                # OPSD off-policy: teacher sees teacher_prompt + the SAME dataset
+                # assistant response as the student. build_opsd_teacher_data was
+                # invoked with strip_assistant=True, so we re-attach the dataset
+                # assistant message from the original inputs to keep the label
+                # positions aligned between student and teacher forwards.
+                #
+                # NOTE: teacher_prompt = original user_content + hint, so it is
+                # ALWAYS longer than the student-side user_content. A row that
+                # just fits `total_length` on the student side may overflow the
+                # same budget on the teacher side and raise MaxLengthError.
+                # Give the teacher a small extra buffer (see the class-level
+                # `_OPSD_TEACHER_LENGTH_BUFFER` constant) so long-audio + hint
+                # rows can still encode. The student-side budget stays exactly
+                # at `total_length`, so the assistant response — and therefore
+                # the label count — remains identical between the two sides.
+                if teacher_data is not None:
+                    teacher_data_ok = True
+                    for i, td in enumerate(teacher_data):
+                        src_messages = inputs[i].get('messages') or []
+                        src_assistant = None
+                        for m in reversed(src_messages):
+                            if m.get('role') == 'assistant':
+                                src_assistant = m
+                                break
+                        if src_assistant is None:
+                            # Missing assistant means we cannot align teacher/student
+                            # label positions; fall back to plain SFT for the whole
+                            # batch (dropping only this row would break batch shape).
+                            teacher_data_ok = False
+                            break
+                        td['messages'].append(dict(src_assistant))
+                        # NOTE: do NOT set td['add_eos'] = False here.
+                        # The student side above encodes with template defaults
+                        # (add_eos=True in training mode -> a trailing EOS is
+                        # appended to the assistant response and becomes a label).
+                        # If we suppress EOS on the teacher side, its label count
+                        # will be exactly 1 less than the student's, which trips
+                        # the OPSD label-count assertion in extract_active().
+                        # STUDENT+vLLM branch sets add_eos=False because vLLM's
+                        # generated response_token_ids already contain EOS, but
+                        # here the assistant string comes straight from the
+                        # dataset and does NOT include a trailing EOS.
+                    if teacher_data_ok:
+                        try:
+                            with self._template_context(self.template, max_length=teacher_total_length):
+                                encoded_inputs['_opsd_teacher_inputs'] = self._prepare_batch_inputs(
+                                    teacher_data, encode_prompt_only=False)
+                        except Exception as e:
+                            # Last-line-of-defense: even with the extra buffer
+                            # some rare corner case still tripped teacher-side
+                            # encoding (e.g. hint significantly longer than
+                            # buffer, or audio processor failure). Fall back
+                            # to plain SFT for this micro-batch instead of
+                            # crashing the whole training run.
+                            logger.warning(
+                                f'OPSD teacher-side encoding failed even with '
+                                f'+{self._OPSD_TEACHER_LENGTH_BUFFER} buffer '
+                                f'(teacher_max_length={teacher_total_length}); '
+                                f'falling back to plain SFT for this micro-batch. Error: {e}')
+                            teacher_data = None
+                    else:
+                        teacher_data = None
+
+
 
             # Mark data source for downstream processing (e.g., conditional SFT loss)
             encoded_inputs['_data_source'] = data_source

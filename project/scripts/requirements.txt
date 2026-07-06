@@ -5,6 +5,9 @@
 # deepspeed<0.19
 # ms-swift
 
+qwen_omni_utils>=0.0.9
+soundfile
+decord
 wandb==0.27.2
 liger-kernel
 vllm==0.10.0

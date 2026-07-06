@@ -147,6 +147,9 @@ megatron_output/
 /*_cached_dataset/
 /sample_output/
 .qoder/
+infer_results/
+project/stepaudio/data/*.jsonl
+project_bk/
 
 # Pytorch
 *.pth

@@ -95,12 +95,17 @@ def get_target_modules(args, model) -> Union[str, List[str]]:
     target_modules = args.target_modules.copy()
     if 'all-linear' in target_modules:
         if model.model_meta.is_multimodal:
+            # exclude MoE router (`.mlp.gate`) unless user explicitly opts in via
+            # `all-router`. Aligns behavior with megatron backend and prevents
+            # peft from trying to inject LoRA into non-Linear router modules
+            # (e.g. Qwen3OmniMoeThinkerTextTopKRouter), which fails at merge time.
             return get_multimodal_target_regex(
                 model,
                 freeze_llm=args.freeze_llm,
                 freeze_vit=args.freeze_vit,
                 freeze_aligner=args.freeze_aligner,
-                include_embedding='all-embedding' in target_modules)
+                include_embedding='all-embedding' in target_modules,
+                exclude_router='all-router' not in target_modules)
         else:
             target_modules.remove('all-linear')
             target_modules += find_all_linears(model)

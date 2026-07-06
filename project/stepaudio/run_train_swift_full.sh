@@ -2,12 +2,17 @@
 # StepAudio2-mini 全参微调脚本（基于 MS-SWIFT, SFT full）
 # 与 run_train_swift.sh (LoRA) 的主要差异：
 #   1. TUNER_TYPE 强制为 full，不再注入 lora_rank / lora_alpha / target_modules 等参数；
-#   2. 默认学习率从 1e-4 降到 1e-5（全参微调对 LR 更敏感，过大易破坏预训练表征）；
+#   2. 默认学习率下调为 5e-6（v17 用 1e-5 出现类别塌陷，见下）；
 #   3. 默认开启 DeepSpeed ZeRO-3 (--deepspeed zero3) 以缓解全参微调的显存压力；
 #      若单卡显存富余/不希望走 deepspeed，可设 USE_DEEPSPEED=0 关闭；
 #   4. save_total_limit 默认下调到 3：full ckpt 体积≈整模型大小，磁盘占用敏感；
 #   5. NUM_EPOCHS 默认 2：full 比 LoRA 更易过拟合，配合 load_best_model_at_end 选最佳点；
 #   6. 默认开启 warmup_ratio=0.03，避免前几个 step 大梯度震荡。
+#   7. [新增] FREEZE_EMBED_LMHEAD=true 默认冻结 embedding 与 lm_head，防止训练破坏
+#            词表分布导致的"类别塌陷"（自回归生成只输出 noise/speech，即使 token_acc
+#            仍有 0.98+）。可通过 EXTRA_FREEZE_PREFIXES 追加更多前缀。
+#   8. [新增] BALANCE_TRAIN=1 默认在训练前派生一个类均衡后的 train.balanced.jsonl，
+#            对多数类降采样、少数类上采样，缓解原始 speech 69% 主导的问题。
 
 set -ex
 
@@ -24,8 +29,40 @@ OUTPUT_DIR=${OUTPUT_DIR:-"$SWIFT_ROOT/output"}
 # 训练超参（可通过环境变量覆盖）
 # 本脚本固定 TUNER_TYPE=full（全参微调），不再支持 lora 切换。
 TUNER_TYPE=full
-# Full 微调推荐的稳健 LR：1e-5。可按需进一步下调到 5e-6/2e-6。
-LEARNING_RATE=${LEARNING_RATE:-1e-5}
+# Full 微调推荐的稳健 LR：默认 1e-6（比原来的 1e-5 更保守）。
+# 经验教训：v17 训练用 lr=1e-5 + 全参 + 未冻结 embedding/lm_head，导致模型在
+# 400~800 步就出现"类别塌陷"（自回归生成只输出 noise/speech，虽然 token_acc
+# 仍然维持 0.98+）。全参微调时 lr 过大 + LM head 一起训 + 类别不均衡是塌陷的
+# 三大主因，故本脚本默认更保守的 1e-6，并配合下方 FREEZE_EMBED_LMHEAD=true。
+# 如仍观察到塌陷可继续下调到 2e-7 / 1e-7。
+LEARNING_RATE=${LEARNING_RATE:-1e-6}
+
+# ---- 冻结策略（针对分类任务的类别塌陷问题） ----
+# 全参微调时，即使 loss_scale 只对 assistant 段计 loss，只更新 1~2 个分类词
+# (speech/music/noise/porn/song) 的梯度也会通过 tie/untie 的 embedding 与
+# lm_head 反向传播扰动整个词表分布，进而让 argmax 塌陷到多数类 (noise/speech)。
+# 建议至少冻结 lm_head 与 embed_tokens，让 LLM 中间层去学"语音特征 -> 类别"
+# 这层映射，避免破坏预训练词表的先验分布。
+#
+# 也可通过 EXTRA_FREEZE_PREFIXES 追加更多前缀，例如
+#   EXTRA_FREEZE_PREFIXES="model.layers.0 model.layers.1 model.layers.2 model.layers.3"
+# 冻结前 4 层 transformer，进一步减轻塌陷。
+FREEZE_EMBED_LMHEAD=${FREEZE_EMBED_LMHEAD:-true}
+EXTRA_FREEZE_PREFIXES=${EXTRA_FREEZE_PREFIXES:-""}
+
+# ---- 类别均衡采样（针对训练数据严重不均衡） ----
+# 观察到的原始 train.jsonl 分布 (56302 条):
+#   speech 69.4% / noise 16.4% / music 5.7% / porn 4.8% / song 3.7%
+# 多数类主导会让全参微调直接学到"永远输出 speech / noise"的捷径。
+#
+# 打开 BALANCE_TRAIN=1 时会在训练前派生一个类均衡后的 train.balanced.jsonl:
+#   - 对多数类 down-sample 到 BALANCE_MAJORITY_CAP 条上限 (默认 8000)
+#   - 对少数类 up-sample 到不少于 BALANCE_MINORITY_MIN 条 (默认 4000, 通过重复实现)
+# 关闭时 (BALANCE_TRAIN=0) 直接使用 TRAIN_JSONL 原样训练。
+BALANCE_TRAIN=${BALANCE_TRAIN:-1}
+BALANCE_MAJORITY_CAP=${BALANCE_MAJORITY_CAP:-8000}
+BALANCE_MINORITY_MIN=${BALANCE_MINORITY_MIN:-4000}
+BALANCE_SEED=${BALANCE_SEED:-42}
 # 默认 epoch 设为 2：
 # - 全参微调下学习能力强，2 epoch 通常已足够拟合；
 # - 配合 load_best_model_at_end + 频繁 eval 在收敛点选 best ckpt；
@@ -41,7 +78,7 @@ GRAD_ACCUM=${GRAD_ACCUM:-16}
 # Warmup：避免前几个 step 大梯度震荡，对 full 微调尤其重要。
 WARMUP_RATIO=${WARMUP_RATIO:-0.03}
 # eval/save 间隔
-SAVE_STEPS=${SAVE_STEPS:-200}
+SAVE_STEPS=${SAVE_STEPS:-100}
 EVAL_STEPS=${EVAL_STEPS:-200}
 # Full 微调的 ckpt 体积≈整模型，磁盘占用敏感，默认仅保留 50 个。
 save_total_limit=${save_total_limit:-50}
@@ -104,6 +141,86 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 DATA_DIR=${DATA_DIR:-"$SCRIPT_DIR/data"}
 TRAIN_JSONL=${TRAIN_JSONL:-"$DATA_DIR/train.jsonl"}
 VAL_JSONL=${VAL_JSONL:-"$DATA_DIR/val.jsonl"}
+
+# ---- 派生类均衡后的 train.balanced.jsonl ----
+if [ "$BALANCE_TRAIN" = "1" ] && [ -f "$TRAIN_JSONL" ]; then
+    TRAIN_BALANCED_JSONL="$DATA_DIR/train.balanced.jsonl"
+    echo "[INFO] 生成类均衡训练集 -> $TRAIN_BALANCED_JSONL (majority_cap=$BALANCE_MAJORITY_CAP minority_min=$BALANCE_MINORITY_MIN seed=$BALANCE_SEED)"
+    TRAIN_JSONL_IN="$TRAIN_JSONL" \
+    TRAIN_BALANCED_JSONL="$TRAIN_BALANCED_JSONL" \
+    BALANCE_MAJORITY_CAP="$BALANCE_MAJORITY_CAP" \
+    BALANCE_MINORITY_MIN="$BALANCE_MINORITY_MIN" \
+    BALANCE_SEED="$BALANCE_SEED" \
+    /data/miniconda3/envs/env-3.12.11/bin/python - <<'PYEOF'
+import json, os, random
+from collections import defaultdict
+
+SRC = os.environ['TRAIN_JSONL_IN']
+DST = os.environ['TRAIN_BALANCED_JSONL']
+CAP = int(os.environ['BALANCE_MAJORITY_CAP'])
+MIN_N = int(os.environ['BALANCE_MINORITY_MIN'])
+SEED = int(os.environ['BALANCE_SEED'])
+
+random.seed(SEED)
+buckets = defaultdict(list)
+with open(SRC, 'r') as f:
+    for line in f:
+        line = line.rstrip('\n')
+        if not line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        ans = ''
+        for m in d.get('messages', []):
+            if m.get('role') == 'assistant':
+                ans = str(m.get('content', '')).strip().lower()
+                break
+        buckets[ans].append(line)
+
+print('[BALANCE] source distribution:')
+for k, v in sorted(buckets.items(), key=lambda x: -len(x[1])):
+    print(f'    {k or "<empty>"}: {len(v)}')
+
+out_lines = []
+for cls, items in buckets.items():
+    if not cls:
+        # skip samples without a valid label
+        continue
+    n = len(items)
+    if n >= CAP:
+        random.shuffle(items)
+        picked = items[:CAP]
+    elif n >= MIN_N:
+        picked = list(items)
+    else:
+        reps = MIN_N // n
+        rem = MIN_N - reps * n
+        pool = items * reps
+        random.shuffle(items)
+        pool.extend(items[:rem])
+        picked = pool
+    out_lines.extend(picked)
+
+random.shuffle(out_lines)
+with open(DST, 'w') as f:
+    for l in out_lines:
+        f.write(l + '\n')
+
+final = defaultdict(int)
+for l in out_lines:
+    d = json.loads(l)
+    for m in d.get('messages', []):
+        if m.get('role') == 'assistant':
+            final[str(m.get('content', '')).strip().lower()] += 1
+            break
+print(f'[BALANCE] balanced total = {len(out_lines)}, distribution:')
+for k, v in sorted(final.items(), key=lambda x: -x[1]):
+    print(f'    {k}: {v}')
+PYEOF
+    TRAIN_JSONL="$TRAIN_BALANCED_JSONL"
+fi
 
 # 派生小 val 集（逻辑与 LoRA 脚本完全一致：按 max_length 过滤超长样本 + 抽样）
 if [ "$VAL_MAX_SAMPLES" -gt 0 ] && [ -f "$VAL_JSONL" ]; then
@@ -192,6 +309,8 @@ echo "[INFO] OUTPUT_DIR  = $OUTPUT_DIR"
 echo "[INFO] TRAIN_JSONL = $TRAIN_JSONL"
 echo "[INFO] VAL_JSONL   = $VAL_JSONL"
 echo "[INFO] TUNER_TYPE  = $TUNER_TYPE (LR=$LEARNING_RATE, WARMUP_RATIO=$WARMUP_RATIO)"
+echo "[INFO] FREEZE_EMBED_LMHEAD = $FREEZE_EMBED_LMHEAD  EXTRA_FREEZE_PREFIXES = ${EXTRA_FREEZE_PREFIXES:-<none>}"
+echo "[INFO] BALANCE_TRAIN = $BALANCE_TRAIN (majority_cap=$BALANCE_MAJORITY_CAP minority_min=$BALANCE_MINORITY_MIN)"
 echo "[INFO] DEEPSPEED   = ${DEEPSPEED_STAGE:-<disabled>}"
 echo "[INFO] CUDA_VISIBLE_DEVICES = $CUDA_VISIBLE_DEVICES (NPROC_PER_NODE=$NPROC_PER_NODE)"
 echo "[INFO] BATCH_SIZE=$BATCH_SIZE EVAL_BATCH_SIZE=$EVAL_BATCH_SIZE GRAD_ACCUM=$GRAD_ACCUM MAX_LENGTH=$MAX_LENGTH"
@@ -242,6 +361,27 @@ fi
 # 组装 tuner 相关参数（full 模式下仅指定 tuner_type，无 LoRA 子参数）
 TUNER_ARGS=(--tuner_type "$TUNER_TYPE")
 
+# ---- 组装冻结参数 ----
+# swift 支持 --freeze_parameters <前缀1> <前缀2> ... 冻结所有以这些前缀开头的参数。
+# 分类任务下强烈建议冻结 embedding 与 lm_head，避免训练破坏词表分布。
+FREEZE_LIST=()
+if [ "$FREEZE_EMBED_LMHEAD" = "true" ] || [ "$FREEZE_EMBED_LMHEAD" = "True" ]; then
+    # StepAudio2 沿用 Qwen2 结构，embedding 名为 model.embed_tokens，输出层为 lm_head
+    FREEZE_LIST+=(model.embed_tokens lm_head)
+fi
+if [ -n "$EXTRA_FREEZE_PREFIXES" ]; then
+    for p in $EXTRA_FREEZE_PREFIXES; do
+        FREEZE_LIST+=("$p")
+    done
+fi
+FREEZE_ARGS=()
+if [ ${#FREEZE_LIST[@]} -gt 0 ]; then
+    FREEZE_ARGS+=(--freeze_parameters "${FREEZE_LIST[@]}")
+    echo "[INFO] FREEZE_PARAMETERS = ${FREEZE_LIST[*]}"
+else
+    echo "[INFO] FREEZE_PARAMETERS = <none> (未冻结 embedding/lm_head，全参训练)"
+fi
+
 # DeepSpeed 参数
 DS_ARGS=()
 if [ -n "$DEEPSPEED_STAGE" ]; then
@@ -273,6 +413,7 @@ NPROC_PER_NODE=$NPROC_PER_NODE \
     --model "$MODEL_PATH" \
     --model_type step_audio2_mini \
     "${TUNER_ARGS[@]}" \
+    "${FREEZE_ARGS[@]}" \
     "${DS_ARGS[@]}" \
     --dataset "$TRAIN_JSONL" \
     --val_dataset "$VAL_JSONL" \

@@ -1643,9 +1643,17 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             while pending_samples and len(valid_samples) < required_count:
                 data = pending_samples.pop(0)
                 try:
-                    remove_response(data['messages'])
-                    template.encode(data)
-                    # Encoding succeeded, add to valid samples
+                    # NOTE: previously this was `remove_response(data['messages']); template.encode(data)`,
+                    # which mutated `data['messages']` in place — pop()-ing the trailing
+                    # assistant turn. That silently corrupted every returned sample:
+                    # downstream template.encode() saw prompt-only messages, produced
+                    # labels that were entirely -100, and OPSD/GKD training collapsed to
+                    # loss=NaN (masked to 0.0 by trainer.logging_nan_inf_filter=True).
+                    # We now validate on a deep copy so `data` stays intact.
+                    probe = {**data, 'messages': deepcopy(data.get('messages', []))}
+                    remove_response(probe['messages'])
+                    template.encode(probe)
+                    # Encoding succeeded, add ORIGINAL sample (with assistant intact).
                     valid_samples.append(data)
                 except Exception as e:
                     # Encoding failed, skip this sample
