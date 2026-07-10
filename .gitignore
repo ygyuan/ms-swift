@@ -149,6 +149,7 @@ megatron_output/
 .qoder/
 infer_results/
 project/stepaudio/data/*.jsonl
+project/stepaudio/data_meld/
 project_bk/
 
 # Pytorch
@@ -157,3 +158,36 @@ project_bk/
 
 # ast template
 ast_index_file.py
+UltraEval-Audio
+project/stepaudio/infer_results/result_v15-20260626-151528_checkpoint-3500_20260629_120843.jsonl
+project/stepaudio/infer_results/result_v15-20260626-151528_checkpoint-7500_20260629_142021.jsonl
+project/stepaudio/infer_results/result_v15-20260626-151528_checkpoint-14080_20260629_101438.jsonl
+project/stepaudio/infer_results/result_v16-20260629-162422_checkpoint-400_20260629_175311.jsonl
+project/stepaudio/infer_results/result_v16-20260629-162422_checkpoint-800_20260629_170604.jsonl
+project/stepaudio/infer_results/result_v16-20260629-162422_checkpoint-1200_20260629_175311.jsonl
+project/stepaudio/infer_results/result_v16-20260629-162422_checkpoint-1600_20260629_175311.jsonl
+project/stepaudio/infer_results/result_v16-20260629-162422_checkpoint-2000_20260629_175311.jsonl
+project/stepaudio/infer_results/result_v17-20260629-190856_checkpoint-400_20260630_140936.jsonl
+project/stepaudio/infer_results/result_v17-20260629-190856_checkpoint-800_20260630_140936.jsonl
+project/stepaudio/infer_results/result_v17-20260629-190856_checkpoint-1200_20260630_140936.jsonl
+project/stepaudio/infer_results/eval_result_v15-20260626-151528_checkpoint-14080_20260629_101438/eval_summary.json
+project/stepaudio/infer_results/eval_result_v15-20260626-151528_checkpoint-14080_20260629_101438/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v15-20260626-151528_checkpoint-3500_20260629_120843/eval_summary.json
+project/stepaudio/infer_results/eval_result_v15-20260626-151528_checkpoint-3500_20260629_120843/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-1200_20260629_175311/eval_summary.json
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-1200_20260629_175311/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-1600_20260629_175311/eval_summary.json
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-1600_20260629_175311/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-2000_20260629_175311/eval_summary.json
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-2000_20260629_175311/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-400_20260629_175311/eval_summary.json
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-400_20260629_175311/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-800_20260629_170604/eval_summary.json
+project/stepaudio/infer_results/eval_result_v16-20260629-162422_checkpoint-800_20260629_170604/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v17-20260629-190856_checkpoint-400_20260630_140936/eval_summary.json
+project/stepaudio/infer_results/eval_result_v17-20260629-190856_checkpoint-400_20260630_140936/threshold_sweep.csv
+project/stepaudio/infer_results/eval_result_v17-20260629-190856_checkpoint-800_20260630_140936/eval_summary.json
+project/stepaudio/infer_results/eval_result_v17-20260629-190856_checkpoint-800_20260630_140936/threshold_sweep.csv
+project/stepaudio/backup/run_eval_meld.sh
+project/stepaudio/backup/run_inference_meld.sh
+project/stepaudio/backup/run_sweep_eval_meld.sh

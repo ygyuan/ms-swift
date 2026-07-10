@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# StepAudio2-mini 推理脚本（音频场景 5 分类）
-# 任务: 输入一段音频，模型直接输出类别字符串，取值范围:
-#       [speech, music, noise, porn, song]
+# StepAudio2-mini 推理脚本（MELD 语音情感 7 分类）
+# 任务: 输入一段音频，模型直接输出情感类别字符串，取值范围:
+#       [surprise, anger, neutral, joy, sadness, fear, disgust]
 # 因此本脚本默认:
 #   - 关闭采样 (temperature=0, top_p=1)，使输出可复现，方便后续做 threshold 评估
-#   - max_new_tokens 设小 (默认 8)，分类只需要少量 token
+#   - max_new_tokens 设小 (默认 2048)，分类只需要少量 token (最长 'surprise'/'sadness'/'disgust' 也在 3 token 内)
 #   - 打开 --logprobs / --top_logprobs，让结果里带上 token 级别的概率分布，
-#     供 eval_classification.py 做 threshold / precision / recall / F1 分析
+#     供 eval_classification_meld.py 做 threshold / precision / recall / F1 分析
 #
 # [新增]  权重加载校验 & 输出健康检查:
 #   - 推理前会把 MODEL_PATH 里的 config / safetensors 分片摘要（大小、head sha1）
@@ -23,7 +23,7 @@
 #                 - 评估原始模型: 直接指向 HF 模型目录, 例如
 #                   /apdcephfs_qy3/share_301069248/huggingface/stepfun-ai/Step-Audio-2-mini
 #   BASE_MODEL    LoRA 基座模型 (仅 LoRA 模式需要, 默认 Step-Audio-2-mini)
-#   VAL_JSONL     待推理的 JSONL (默认 project/stepaudio/data/val.jsonl)
+#   VAL_JSONL     待推理的 JSONL (默认 project/stepaudio/data_meld/test.jsonl, MELD 官方 test 集)
 #   RESULT_PATH   结果保存路径   (默认 project/stepaudio/infer_results/result_<ckpt>_<ts>.jsonl)
 #   MAX_NEW_TOKENS / TEMPERATURE / TOP_P / TOP_LOGPROBS / LOGPROBS  推理超参
 #   MAX_SAMPLES   只推理前 N 条 (调试用，0 表示全量)
@@ -33,19 +33,24 @@
 #   EVAL_BATCH_SIZE      每个进程的推理 batch 大小 (默认 1; 增大可提升吞吐, 但需注意:
 #                        1) 显存占用线性增长; 2) batch>1 时各样本会做 padding,
 #                        请先小批量与 batch=1 对比 logprobs 是否一致再放大)
+#   USE_CACHE            是否启用 HF generate 的 KV cache. 默认 false (对齐 UltraEval-Audio
+#                        的 use_cache=False, 是拿到 55.47 baseline 的关键之一).
+#                        USE_CACHE=false 时脚本会把 helpers/pyshim 前置到 PYTHONPATH,
+#                        通过 sitecustomize.py monkey-patch swift 强制关闭 KV cache;
+#                        USE_CACHE=true 则保持 swift/HF 默认 (True), 用于回滚对比.
 #
 # 用法示例:
-#   MODEL_PATH=/path/to/output/v0-xxx/checkpoint-1000 bash run_inference.sh
-#   MODEL_PATH=/path/to/lora_ckpt BASE_MODEL=/path/to/base bash run_inference.sh
-#   MODEL_PATH=/path/to/checkpoint MAX_SAMPLES=100 bash run_inference.sh
+#   MODEL_PATH=/path/to/output/v0-xxx/checkpoint-1000 bash run_inference_meld.sh
+#   MODEL_PATH=/path/to/lora_ckpt BASE_MODEL=/path/to/base bash run_inference_meld.sh
+#   MODEL_PATH=/path/to/checkpoint MAX_SAMPLES=100 bash run_inference_meld.sh
 #   # 也支持 KEY=VALUE 直接通过命令行覆盖, 例如:
-#   bash run_inference.sh MODEL_PATH=/path/to/checkpoint NPROC_PER_NODE=2
-#   # 显式指定 RESULT_PATH 以便外层脚本拿到固定路径再喂给 run_eval.sh:
-#   bash run_inference.sh MODEL_PATH=/path/to/ckpt RESULT_PATH=/tmp/result.jsonl
+#   bash run_inference_meld.sh MODEL_PATH=/path/to/checkpoint NPROC_PER_NODE=2
+#   # 显式指定 RESULT_PATH 以便外层脚本拿到固定路径再喂给 run_eval_meld.sh:
+#   bash run_inference_meld.sh MODEL_PATH=/path/to/ckpt RESULT_PATH=/tmp/result.jsonl
 #   # 4 卡 DDP 并行推理:
-#   MODEL_PATH=/path/to/checkpoint NPROC_PER_NODE=4 bash run_inference.sh
+#   MODEL_PATH=/path/to/checkpoint NPROC_PER_NODE=4 bash run_inference_meld.sh
 #   # 指定卡 1,2,3 三张卡并行推理:
-#   MODEL_PATH=/path/to/checkpoint NPROC_PER_NODE=3 CUDA_VISIBLE_DEVICES=1,2,3 bash run_inference.sh
+#   MODEL_PATH=/path/to/checkpoint NPROC_PER_NODE=3 CUDA_VISIBLE_DEVICES=1,2,3 bash run_inference_meld.sh
 
 set -e
 
@@ -55,7 +60,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SWIFT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$SWIFT_ROOT"
 
-# 允许 `bash run_inference.sh KEY=VALUE ...` 这种方式覆盖环境变量,
+# 允许 `bash run_inference_meld.sh KEY=VALUE ...` 这种方式覆盖环境变量,
 # 同时把这些 KEY=VALUE 从 $@ 中剔除, 避免被当成 swift infer 的额外参数透传。
 PASS_THROUGH_ARGS=()
 for kv in "$@"; do
@@ -70,15 +75,52 @@ for kv in "$@"; do
 done
 set -- "${PASS_THROUGH_ARGS[@]}"
 
-VAL_JSONL=${VAL_JSONL:-"$SCRIPT_DIR/data/val.jsonl"}
+VAL_JSONL=${VAL_JSONL:-"$SCRIPT_DIR/data_meld/test.jsonl"}
 
 # 分类任务默认参数（覆盖原来面向 chat/tts 的默认值）
 # 注意: swift infer 没有 --do_sample 参数；temperature=0 即等价于贪心解码（do_sample=False）。
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8}
+#
+# 【v3 关键修复 · 对齐 UltraEval-Audio 55.47% baseline】
+# ─────────────────────────────────────────────────────────
+# 之前用同一份 wav + 同一份 prompt (从 UltraEval 严格重建的 test.jsonl) 跑 swift infer 还是
+# 塌陷成 99.8% neutral (acc=48%), 而 UltraEval 官方能拿 55.47%. 排查 UltraEval-Audio 的
+# audio_evals/models/step_audio_2_mini.py 发现 2 个决定性差异:
+#
+#   (A) 【必须】UltraEval 显式注入 system prompt "You are a helpful assistant.":
+#         if not has_system:
+#             messages.append({"role":"system","content":"You are a helpful assistant."})
+#       完整 prompt 是: <|BOT|>system\nYou are a helpful assistant.<|EOT|><|BOT|>human\n...
+#       Step-Audio-2-mini 训练时肯定用了 system prompt, 缺失时输出分布严重偏移.
+#       swift 默认 --system 是 None, 我们必须显式传. 这是 55.47 vs 48.08 差距的核心原因.
+#
+#   (B) UltraEval 的 max_new_tokens=2048, 让模型自由生成完整词 (可能是 "neutral" 也可能
+#       是 "the emotion is neutral", eval 时靠字面匹配前 4 字符). 我们之前 MAX_NEW_TOKENS=4/32
+#       会把模型输出截成半个词, 虽然对 first-token argmax 无影响 (health 里 mean_p=0.54 说明
+#       模型输出稳定), 但 response 字面无法做 threshold sweep. 【v4 对齐 UltraEval】直接放到
+#       2048, 让模型自由生成, response 字面就能直接跟 UltraEval 的 55.47 baseline 对拍.
+#       (贪心解码 temperature=0, 遇到 <|EOT|> 就停, 实测 200 样本平均 ~5 token, 长度上限只是保险.)
+#
+#   (C) 【必须】UltraEval 显式用 use_cache=False 调 model.generate. Step-Audio-2-mini 的
+#       audio_encoder + adaptor 侧 KV cache 在 batch/序列拼接时会有 bug (输出会漂移),
+#       UltraEval 官方就是靠关掉 KV cache 才拿到 55.47. swift CLI 没有 --use_cache 参数,
+#       InferArguments 也无 generation_config 字段, 因此我们通过 sitecustomize.py 在
+#       解释器启动时 monkey-patch swift.infer_engine.utils.prepare_generation_config,
+#       强制 use_cache=False. 默认开启 (USE_CACHE=false); 需要还原 KV cache 时设
+#       USE_CACHE=true.
+SYSTEM=${SYSTEM:-"You are a helpful assistant."}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-2048}
 TEMPERATURE=${TEMPERATURE:-0.0}
 TOP_P=${TOP_P:-1.0}
 LOGPROBS=${LOGPROBS:-true}
 TOP_LOGPROBS=${TOP_LOGPROBS:-20}
+# 是否启用 HF generate 的 KV cache. 默认关 (对齐 UltraEval-Audio 的 use_cache=False).
+# 只接受 true / false 两值. false 时通过 sitecustomize shim monkey-patch swift.
+USE_CACHE=${USE_CACHE:-false}
+USE_CACHE_LC=$(echo "$USE_CACHE" | tr '[:upper:]' '[:lower:]')
+if [ "$USE_CACHE_LC" != "true" ] && [ "$USE_CACHE_LC" != "false" ]; then
+    echo "[ERROR] USE_CACHE 只接受 true/false, 当前=$USE_CACHE" >&2
+    exit 1
+fi
 # 处理超长样本：
 #   - MAX_LENGTH: 输入 token 上限。**必须 ≤ 模型自身的 max_model_len（step_audio_2_mini=16384）**，
 #       并给 max_new_tokens 留出余量，否则推理引擎会算出 max_tokens<=0 直接崩。
@@ -166,7 +208,7 @@ export NPROC_PER_NODE
 # torch.distributed.run 默认使用 MASTER_PORT=29500 (由 swift/utils/torch_utils.py 兜底);
 # 同一台机器如果并发跑多个 DDP 任务, 或历史进程未清理, 会撞到 EADDRINUSE.
 # 策略:
-#   - 用户/上层脚本 (如 run_sweep_eval.sh) 显式给了 MASTER_PORT, 就尊重之;
+#   - 用户/上层脚本 (如 run_sweep_eval_meld.sh) 显式给了 MASTER_PORT, 就尊重之;
 #   - 否则 NPROC_PER_NODE>1 时用 python 挑一个操作系统当前空闲的端口;
 #   - NPROC_PER_NODE=1 时不走 torch.distributed.run, 无需设置.
 if [ "$NPROC_PER_NODE" -gt 1 ]; then
@@ -215,6 +257,24 @@ echo "[INFO] EVAL_BATCH_SIZE      = $EVAL_BATCH_SIZE  [每个进程的推理 bat
 echo "[INFO] temperature=$TEMPERATURE  [0 表示贪心], top_p=$TOP_P, max_new_tokens=$MAX_NEW_TOKENS"
 echo "[INFO] logprobs=$LOGPROBS, top_logprobs=$TOP_LOGPROBS"
 echo "[INFO] max_length=$MAX_LENGTH, truncation_strategy=$TRUNCATION_STRATEGY"
+echo "[INFO] use_cache=$USE_CACHE_LC  [false 时通过 sitecustomize shim 强制关 KV cache, 对齐 UltraEval-Audio]"
+
+# ---- 通过 sitecustomize.py 注入 use_cache=False (仅当 USE_CACHE=false) ----
+# 详见 helpers/pyshim/sitecustomize.py 顶部注释. 这里做两件事:
+#   1) 把 helpers/pyshim 前置到 PYTHONPATH, 让 python 启动时自动 import sitecustomize
+#      (CPython 官方机制, 对 torch.distributed.run 起的每个子进程同样生效, DDP 下也 OK).
+#   2) 用 STEPAUDIO_DISABLE_KV_CACHE=1 作为触发开关, 避免这个 sitecustomize 在其他
+#      无关 python 进程里意外接管 swift 的 generation_config.
+PYSHIM_DIR="$SCRIPT_DIR/helpers/pyshim"
+if [ "$USE_CACHE_LC" = "false" ]; then
+    if [ -f "$PYSHIM_DIR/sitecustomize.py" ]; then
+        export PYTHONPATH="$PYSHIM_DIR${PYTHONPATH:+:$PYTHONPATH}"
+        export STEPAUDIO_DISABLE_KV_CACHE=1
+        echo "[INFO] 已启用 sitecustomize shim 强制 use_cache=False (PYTHONPATH 前置: $PYSHIM_DIR)"
+    else
+        echo "[WARN] USE_CACHE=false 但未找到 $PYSHIM_DIR/sitecustomize.py, 无法关闭 KV cache" >&2
+    fi
+fi
 
 # 选择 swift 入口
 # 注意: 子 shell 中 python/swift 可能因为 rc 钩子被切到别的 conda 环境
@@ -262,6 +322,11 @@ INFER_ARGS=(
     --truncation_strategy "$TRUNCATION_STRATEGY"
     --stream false
 )
+# 【v3】对齐 UltraEval-Audio 的 system prompt 注入 (Step-Audio-2 训练模板需要 system).
+# 若空字符串则跳过 --system, 保留传空的能力.
+if [ -n "$SYSTEM" ]; then
+    INFER_ARGS+=(--system "$SYSTEM")
+fi
 if [ -n "$ADAPTERS" ]; then
     INFER_ARGS+=(--adapters "$ADAPTERS")
 fi
@@ -330,7 +395,7 @@ if [ -f "$RESULT_PATH" ]; then
         set +e
         HEALTH_INPUT="$RESULT_PATH" \
         HEALTH_OUTPUT="$HEALTH_JSON" \
-        HEALTH_CLASSES="${HEALTH_CLASSES:-speech,music,noise,porn,song}" \
+        HEALTH_CLASSES="${HEALTH_CLASSES:-s,a,n,j,d,f,g,surprise,anger,neutral,joy,sadness,fear,disgust}" \
         HEALTH_SAMPLE_LIMIT="${HEALTH_SAMPLE_LIMIT:-500}" \
         python3 "$HEALTH_HELPER"
         _health_rc=$?
@@ -344,7 +409,7 @@ if [ -f "$RESULT_PATH" ]; then
     fi
 
     echo "[INFO] 下一步可直接运行评估:"
-    echo "       bash $SCRIPT_DIR/run_eval.sh \\"
+    echo "       bash $SCRIPT_DIR/run_eval_meld.sh \\"
     echo "            RESULT_PATH=$RESULT_PATH \\"
     echo "            VAL_JSONL=$VAL_JSONL"
 fi

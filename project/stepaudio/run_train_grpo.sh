@@ -138,6 +138,12 @@ if [ "$MODEL_PATH" = "/apdcephfs_qy3/share_301069248/huggingface/stepfun-ai/Step
     echo "[WARN] 已通过 STRICT_SFT_WARMUP=0 允许冷启动，请注意 rare-class 崩塌风险。"
 fi
 OUTPUT_DIR=${OUTPUT_DIR:-"$SWIFT_ROOT/output/stepaudio/grpo"}
+# ms-swift 默认 add_version=True, 会在 OUTPUT_DIR 后自动追加 v<idx>-<timestamp>
+# 子目录 (见 swift/arguments/sft_args.py 中 _add_version)。设 ADD_VERSION=false
+# 可让 checkpoints 直接落到 $OUTPUT_DIR 下, 便于外部脚本按固定路径消费。
+# 注意：关闭 add_version 后，若同一 OUTPUT_DIR 重复启动训练会覆盖之前的
+# checkpoints/logs, 请自行确认是否是想要的行为。
+ADD_VERSION=${ADD_VERSION:-true}
 
 # ---------------- Tuner ----------------
 # lora（默认，强烈推荐）/ full（高显存）
@@ -754,6 +760,7 @@ NPROC_PER_NODE=$NPROC_PER_NODE \
     --gradient_checkpointing false \
     "${EXTRA_ARGS[@]}" \
     --output_dir "$OUTPUT_DIR" \
+    --add_version $ADD_VERSION \
     --report_to tensorboard \
     --save_strategy steps \
     --save_steps $SAVE_STEPS \

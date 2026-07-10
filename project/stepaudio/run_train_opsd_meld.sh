@@ -1,5 +1,43 @@
 #!/usr/bin/env bash
-# StepAudio2-mini OPSD（On-Policy Self-Distillation）后训练脚本（基于 MS-SWIFT）
+# StepAudio2-mini OPSD（On-Policy Self-Distillation）后训练脚本 —— MELD 情感 7 分类版（基于 MS-SWIFT）
+#
+# ════════════════════════════════════════════════════════════════════════════
+# 【任务差异 · 相对 ASC 5 分类的 run_train_opsd.sh】
+# ════════════════════════════════════════════════════════════════════════════
+# 类别 (7):     surprise, anger, neutral, joy, sadness, fear, disgust
+# 数据目录:     project/stepaudio/data_meld/  (word 版, assistant label 是完
+#               整单词; letter 版已被 SFT 脚本头部复盘证明会塌陷)
+# 数据分布:     neutral 47.2% / joy 17.4% / anger 12.1% / surprise 11.9% /
+#               sadness 7.2% / disgust 2.7% / fear 2.7%    (train 9989 条)
+# SFT 起点:     MELD full SFT (v0-20260707-182357/checkpoint-234) test
+#               acc=59.8%, macro-F1=43.0%; LoRA v7 checkpoint-150 acc=58.5%,
+#               macro-F1=41.2%. 相比 ASC (SFT 已经 97.83%) MELD SFT 起点
+#               弱得多, 但这也意味着教师能提供有价值的软分布信号.
+# OPSD EV:      与 ASC 完全不同：ASC 上的 OPSD (v13/v14/v15) 都在行为
+#               "从 97.8% 降到 50%" 的负向方向上抖, 因为教师本身已处
+#               于最优点附近, hint / soft target / JSD 带来的都是噪声.
+#               MELD 是相反的【正 EV】场景：
+#                 - SFT 已学会情感分类的大方向 (>50% acc)，但造会现象
+#                   严重 (neutral over-prediction: recall 84%, joy/sadness/
+#                   fear 被大量预测为 neutral)；
+#                 - 教师在看到 GT hint 后可以给出 "真正的情感 rank", 包含
+#                   比 SFT one-hot label 更丰富的类间相似度信号 (例如
+#                   surprise vs joy 相似, fear vs sadness 相似)；
+#                 - 这些相似度矩阵正是 MELD 需要学的 "情感中组结构".
+#
+# 与 ASC 脚本的关键差异：
+#   * MODEL_PATH 默认 = MELD SFT 后 ckpt (需用户刷新为自己的 run)；
+#   * OUTPUT_DIR / DATA_DIR / TRAIN_JSONL 全部指向 data_meld / output/meld；
+#   * TARGET_CLASS 从 "porn" 换成 "fear" (MELD 的美回归任务: recall 只有 20%)；
+#   * OPSD_HINT_MODE 默认维持 rank 多选题式 (适合 7 类, 避免 direct hint
+#     下教师软分布 ≈ one-hot(gt) 的退化问题)；
+#   * LR 从 5e-7 抬到 1e-6（MELD 起点弱允许更大步长）；
+#   * MAX_STEPS 从 1000 抬到 1500 (rare-class 需要多 epoch 学习)；
+#   * SFT_ALPHA 从 2.0 降到 1.0（MELD one-hot NLL 会把分布拉回 neutral, 需要
+#     释放更多权重给 JSD 去学习情感中组结构）；
+#   * SYSTEM 强制注入 "You are a helpful assistant." (对齐 UltraEval-Audio
+#     baseline; SFT / 推理 / OPSD 三方一致).
+# ════════════════════════════════════════════════════════════════════════════
 #
 # === 这是什么 ===
 # OPSD = On-Policy Self-Distillation：
@@ -77,14 +115,76 @@ cd "$SWIFT_ROOT"
 #      accuracy=97.83% (noise F1=0.952 / porn F1=0.952)，是稳定可用的 OPSD 起点。
 # 因此默认值调整为 checkpoint-1600-merged。**禁止再使用 checkpoint-400-merged**——
 # 若发现旧目录仍存在，建议手动 rm -rf 后重跑。
-MODEL_PATH=${MODEL_PATH:-$SWIFT_ROOT/output/v16-20260629-162422/checkpoint-1600-merged}
-OUTPUT_DIR=${OUTPUT_DIR:-"$SWIFT_ROOT/output/stepaudio/opsd/v3"}
+MODEL_PATH=${MODEL_PATH:-/apdcephfs_qy3/share_301069248/huggingface/stepfun-ai/Step-Audio-2-mini}
+if [ "$MODEL_PATH" = "/apdcephfs_qy3/share_301069248/huggingface/stepfun-ai/Step-Audio-2-mini" ]; then
+    echo ""
+    echo "[WARN] ============================================================"
+    echo "[WARN] MODEL_PATH 指向的是原始 base 模型（未 MELD SFT）。"
+    echo "[WARN] MELD OPSD 必须从 SFT 后的 ckpt 起步（冷启动 → 教师 == 学生 == base,"
+    echo "[WARN]   无知识可蒸, JSD 退化为噪声, 会重现 ASC v13/v14 塌崩曲线）。"
+    echo "[WARN] 推荐候选："
+    echo "[WARN]   * MELD full SFT : ./output/meld/v0-20260707-182357/checkpoint-234"
+    echo "[WARN]   * MELD LoRA SFT : ./output/meld/v7-20260707-162917/checkpoint-150 (自动 merge)"
+    echo "[WARN] 例:  MODEL_PATH=./output/meld/v0-20260707-182357/checkpoint-234 bash \$0"
+    echo "[WARN] 若坚持从 base 冷启动，请显式设置：STRICT_SFT_WARMUP=0"
+    echo "[WARN] ============================================================"
+    if [ "${STRICT_SFT_WARMUP:-1}" = "1" ]; then
+        echo "[FATAL] 拒绝冷启动 OPSD（STRICT_SFT_WARMUP=1，默认）。请指定 MELD SFT 后的 MODEL_PATH。"
+        exit 16
+    fi
+fi
+
+OUTPUT_DIR=${OUTPUT_DIR:-"$SWIFT_ROOT/output/meld/opsd/v3"}
 # ms-swift 默认 add_version=True, 会在 OUTPUT_DIR 后自动追加 v<idx>-<timestamp>
 # 子目录 (见 swift/arguments/sft_args.py 中 _add_version)。设 ADD_VERSION=false
 # 可让 checkpoints 直接落到 $OUTPUT_DIR 下, 便于外部脚本按固定路径消费。
 # 注意：关闭 add_version 后，若同一 OUTPUT_DIR 重复启动训练会覆盖之前的
 # checkpoints/logs, 请自行确认是否是想要的行为。
 ADD_VERSION=${ADD_VERSION:-false}
+
+# 【MELD 关键 · SYSTEM prompt · 对齐 UltraEval-Audio baseline】
+# UltraEval-Audio 官方推理器 (audio_evals/models/step_audio_2_mini.py:180) 强制
+# 注入 system="You are a helpful assistant.". SFT / 推理 / OPSD 必须一致,
+# 否则 policy 分布会因 prompt 前缀变化而漂移, 二次塌缩。
+SYSTEM=${SYSTEM:-"You are a helpful assistant."}
+
+# ---------------- 冻结策略（借鉴 run_train_sft_full_meld.sh v2 · 防类别塌陷）----------------
+# 【SFT-full v0/v1/v6 事故教训 · MELD letter 版】
+# 未冻结 embedding + lm_head 时, 即使 loss 只对 assistant 那 1 个分类 token 计梯度,
+# 通过 embed / lm_head 反向传播依然会扰动整个词表分布, 400-800 步内 argmax 就塌陷到
+# 多数类 (v0-full ckpt-50 → 99.9% 预测 neutral, acc=48%).
+# OPSD 场景更危险：sft_alpha=3.0 让 CE 权重更高, 且 on-policy generate 每步都用当前
+# 权重采样, 一旦 embed/lm_head 被推歪, 学生下一步就吐更歪的 completion, 教师被污染,
+# 迅速形成正反馈崩溃。因此 OPSD 默认冻结 embed+lm_head, 让学习集中在 attention layers。
+#
+# 注意: MELD 词汇 (surprise/anger/neutral/joy/sadness/fear/disgust) 都是普通英文 token,
+# 冻结 embedding 只是不让"这几个 token 的向量"被推来推去, 不影响 LLM 中间层学习。
+# 【路径 A6 追加】默认 FREEZE_EMBED_LMHEAD=true; 若观察到严重欠拟合可 =false 手动打开。
+FREEZE_EMBED_LMHEAD=${FREEZE_EMBED_LMHEAD:-true}
+# 可追加冻结前若干 transformer 层进一步稳定 (SFT-full 建议 model.layers.0-3)。
+# 默认空, 依靠 embed+lm_head 冻结即可。
+EXTRA_FREEZE_PREFIXES=${EXTRA_FREEZE_PREFIXES:-""}
+# vit (audio encoder) 冻结: 32 层 conformer 参数量大, 全参训练不稳且吃显存;
+# OPSD 教师+学生双 forward 场景下更应冻结 vit 节省显存。
+FREEZE_VIT=${FREEZE_VIT:-true}
+# aligner (adapter, ~10M 参数) 是 audio → LLM 的关键桥梁, 保持可训, OPSD 才能
+# 真正把音频情感语义蒸馏进桥接层; SFT-full 也是 aligner=false。
+FREEZE_ALIGNER=${FREEZE_ALIGNER:-false}
+# LLM 主体默认可训。LoRA 模式下 freeze_llm=false 但只有 lora 参数会更新, 语义无冲突。
+FREEZE_LLM=${FREEZE_LLM:-false}
+
+# ---------------- label_smoothing (借鉴 SFT-full 关键 bug 说明) ----------------
+# 【swift + step_audio2 组合的 label_smoother shift bug 说明】
+# swift/trainers/seq2seq_trainer.py 里对 label_smoother 的调用:
+#   if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+#       loss = self.label_smoother(outputs, labels, shift_labels=True)
+#   else:
+#       loss = self.label_smoother(outputs, labels)   # ← shift_labels=False!
+# 'StepAudio2ForCausalLM' 不在 transformers 映射表, 走 else 分支 → logits 与 labels
+# 未 shift 对齐, train_loss 可飙到 ~52 (SFT-full v4/v5 LoRA 实测)。
+# OPSD 走 GKD trainer, 目前观察未复现该 bug (loss ~1.1 正常), 但为一致性显式设为 0.0,
+# 避免"未来某次实验加了 smoothing 才触发"的隐患。
+LABEL_SMOOTHING=${LABEL_SMOOTHING:-0.0}
 
 # ---------------- OPSD 教师模式 ----------------
 # OPSD_TEACHER_MODE:
@@ -170,7 +270,64 @@ else
     # 兼容性：
     #   OPSD_HINT_MODE=direct/guided/rank 三模式共存，环境变量切换；
     #   TRAIN_JSONL 环境变量可覆盖数据集选择（默认 softbal，A3 手动指定 targeted）。
-    DEFAULT_LR=5e-7
+    #
+    # 【路径 A4（当前默认 · 恢复真 on-policy self-distillation）】
+    # 【A3 结果复盘】v3 (max_steps=1000, lmbda=0.0, beta=0.5, lr=5e-7) sweep 结果：
+    #     ckpt    accuracy   macro-F1    vs SFT-v7-150 (41.17)
+    #     100     0.5571     0.3256      -8.61 pp
+    #     300     0.5621     0.3481      -6.36 pp
+    #     500     0.5421     0.3555      -5.62 pp  (v3 best)
+    #     1000    0.5103     0.3289      -8.28 pp  (塌回 neutral+joy)
+    # 结论：
+    #   * v3 无一 ckpt 超过 SFT baseline；
+    #   * 500 步后 macro-F1 塌陷 (neutral R 90→70, surprise R 51→25)；
+    #   * lmbda=0 + teacher=disable_adapter(self) 让 KL 项梯度近零，训练完全走 CE。
+    #
+    # A4 三项核心改动（本次 v4 默认）：
+    #   (1) LMBDA 0.0 → 1.0：每步真 on-policy generate，让 student 从自己的采样里
+    #       学习，才叫 On-Policy Self-Distillation；同时 KL 项因 student 和 teacher
+    #       输出分布真实不同而产生非零梯度。
+    #   (2) BETA 0.5 → 0.1：v3 证明 mode-covering 分量在 self-distillation 下
+    #       几乎无信号，降到 0.1 让 CE (SFT_ALPHA=2.0) 更主导训练方向，KL 只做正则。
+    #   (3) LR 5e-7 → 1e-7 / MAX_STEPS 1000 → 300：on-policy 对 LR 更敏感（learner
+    #       每步都要 sample，噪声更大），配合早停避免 v3 那种 "500 步后塌陷"。
+    #
+    # 配套：
+    #   * OPSD_TARGET_OVERSAMPLE=1 默认开启（fear 从 2.7% → 30%，见 v3 fear R 只有
+    #     10-14%，不上采样几乎无梯度），配合 OPSD_TARGET_RATIO=0.10-0.15 抑制过拟合。
+    #   * SAVE/EVAL_STEPS 100 → 25：v3 每 100 步一存 (共 10 个 ckpt) 太粗，500-1000
+    #     step 之间可能有 sweet spot 被漏；A4 每 25 步一存 (共 12 个 ckpt) 密集观察。
+    #   * MAX_COMPLETION_LENGTH 16 → 8：分类 3-4 token 就够，lmbda=1.0 每步都 generate，
+    #     缩短能显著减少显存。
+    #   * OPSD_ONPOLICY_DRIFT_ABORT_STEPS=50 (默认)：训练结束或 kill 后回读
+    #     output_dir/completions.jsonl 前 50 步，若出现 <audio_*>/<tts_*> 立即报警。
+    #
+    # 【路径 A5（当前默认 · 修 teacher hint + 多类 minority 上采样）】
+    # 【A4 结果复盘】v4 (max_steps=300, lmbda=1.0, beta=0.1, lr=1e-7, oversample fear@0.10)
+    # sweep 结果：
+    #     ckpt    accuracy   macro-F1    vs SFT-v7-150 (41.17)
+    #     25      0.5575     0.3290      -8.27 pp
+    #     150     0.5590     0.3482      -6.35 pp  (v4 best)
+    #     300     0.5525     0.3426      -6.91 pp  (轻微退步)
+    # 关键 minority recall: fear 14->16 / disgust 12->13 / anger 10->13——远低于 SFT。
+    # 根因（v4 首次暴露的真凶）：
+    #   train.opsd.rank.jsonl 里 teacher_prompt hint = "rank {speech, music, noise, porn, song}"，
+    #   完全是 OPSD 五类版遗留，与 MELD 7 类冲突。教师被喂逻辑不通的 prompt，softmax
+    #   分布紊乱，KL 分支几乎无有效蒸馏信号；训练实质仍是 CE-driven SFT (LR=1e-7 时几乎不动)。
+    #
+    # A5 三项核心改动（本次 v5 默认）：
+    #   (1) hint 模板 7 类化：修正 rank/direct/guided 三个 template 里的类别列表；
+    #       hash 变化自动重建 train.opsd.rank.jsonl。这是 A5 的 primary fix。
+    #   (2) 多类 oversample：新增 OPSD_TARGET_CLASSES=fear,disgust,anger，把三个
+    #       严重欠拟合的 minority 类同时抬到 ratio=0.12；避免 v4 只补 fear 单类，
+    #       disgust/anger 依然"每 batch 0-1 样本"导致学不动。
+    #   (3) LR 1e-7 → 3e-7 / BETA 0.1 → 0.2：hint 修好后教师有真信号，敢学快一点、
+    #       给 KL 分支更大权重；MAX_COMPLETION_LENGTH 8 → 6 进一步压显存 / 防漂。
+    #
+    # 若 v5 仍未超过 SFT baseline，下一步 A6 应考虑：
+    #   (a) 直接放弃 rank hint，改 direct hint（教师看到 gt）+ 强 CE alpha；
+    #   (b) 或彻底放弃 OPSD 路线，改 SFT + class-balanced sampler / focal loss。
+    DEFAULT_LR=3e-7
 fi
 LEARNING_RATE=${LEARNING_RATE:-$DEFAULT_LR}
 
@@ -198,11 +355,25 @@ LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-q_proj k_proj v_proj o_proj}
 # 音频码本分支——ckpt-50 已产出 2.4% 无效响应。
 # 路径 A2 改为 beta=0.5 (标准 JSD)：mode-covering 与 mode-seeking 平衡，配合
 # topk=5 物理过滤后已经不含 <tts_*>/<audio_*>，且不再对教师顶点 token 过度敏感。
-# 【路径 A3】保持 beta=0.5：rank hint 下教师输出结构化软分布（top-5 各类都有非零
+# 【路径 A3】保持 beta=0.5：rank hint 下教师输出结构化软分布（top-7 各类都有非零
 # 概率，非 one-hot），mode-covering 分量能让学生学到"完整的类间相对结构"（不只是
 # top-1 峰值），mode-seeking 分量防止学生在低概率类别上过度覆盖噪声。这是 OPSD
 # 论文推荐的默认值，也是路径 A3 相对 v13/v14 极端配置的一次矫正。
-BETA=${BETA:-0.5}
+# 【路径 A4（v3 结果复盘）】v3 (macro-F1 500 步=35.55 vs SFT 41.17) 证明 beta=0.5 +
+# lmbda=0.0 组合下 KL 项做的是"student ↔ disable_adapter(student)"，自蒸馏
+# gradient 几乎为零，训练完全被剩下 50% × CE 主导，等价于 LR=2.5e-7 的 SFT。
+# 结果就是 sweep_eval_summary 里所有 ckpt 都在 SFT baseline 之下。
+# A4 把 beta 从 0.5 降到 0.1：CE 项主导（90%）保证学生朝"训练数据里的教师软标签"
+# 前进，KL 项（10%）只做"轻正则，防止学生塌回 base neutral 塌陷解"。
+# 【路径 A5（v4 结果复盘）】v4 macro-F1 best=34.82 (150 步) 仍低于 SFT 41.17，
+# 且 fear R 只涨到 16.00 / disgust R 只涨到 13.24 / anger R 停在 10-12%。
+# 根因：train.opsd.rank.jsonl 里 teacher_prompt 的 hint 模板是从 OPSD 五类版
+# 直接 copy 过来的"rank {speech, music, noise, porn, song}"——与 MELD 7 类完全
+# 无关，教师被喂了逻辑冲突的 prompt，softmax 输出紊乱，KL 分支几乎没信号。
+# A5 修复：把 rank/direct/guided 三个 hint 模板全部改为 MELD 7 类；hash 变化
+# 会自动触发 rank.jsonl 重建。同时把 beta 从 0.1 提到 0.2，让好 hint 的教师
+# 信号影响力适度增加。
+BETA=${BETA:-0.2}
 # lmbda：on-policy 触发概率
 #   1.0 = 每个 step 都用学生当前权重 generate 一段 completion 做训练（纯 on-policy）
 #   0.0 = 不做 on-policy 采样，直接用数据集里的 assistant 答案作为目标序列
@@ -214,7 +385,12 @@ BETA=${BETA:-0.5}
 #         教师在同一位置给出软分布，才能稳定训练。
 #         如果 MODEL_PATH 已是 SFT 后的 checkpoint 且分类准确率 >85%，
 #         再考虑改回 1.0 做纯 on-policy 精修。
-LMBDA=${LMBDA:-0.0}
+# 【路径 A4】MELD SFT 起点 acc=58% 远达不到 "85%" 门槛，但 v3 结果证明 lmbda=0.0
+# 让 OPSD 退化成 KL-regularized SFT，方向由 train.opsd.rank.jsonl 的教师软标签
+# 决定，不是"策略自我改进"。改成 1.0 试真 on-policy self-distillation——但必须
+# 配合前 50 步 completions 漂移守护（见 OPSD_ONPOLICY_DRIFT_ABORT_STEPS），若
+# 出现 <audio_XXX>/<tts_end> 立即 abort，防止 stepaudio 音频码本分支污染教师。
+LMBDA=${LMBDA:-1.0}
 # 采样温度（仅 lmbda>0 时影响学生 generate；分类任务不需要多样性）
 TEMPERATURE=${TEMPERATURE:-1.0}
 # Top-K logits 蒸馏：
@@ -224,7 +400,10 @@ TEMPERATURE=${TEMPERATURE:-1.0}
 # reverse-KL 下锁到这些 token，直接漂到音频分支（ckpt-50 就有 2.4% invalid response）。
 # 路径 A2 直接压到 K=5 = 类别数，物理上过滤掉所有 <tts_*>/<audio_*>，蒸馏目标
 # 只保留 5 个类别 label token 之间的相对分布——这才是分类任务的真实软标签信号。
-GKD_LOGITS_TOPK=${GKD_LOGITS_TOPK:-5}
+# 【路径 A5】保持 GKD_LOGITS_TOPK=5（OPSD 五类版遗留）——【路径 A6】改为 7
+# 对齐 MELD 7 类：不然 KL 分布里总会有 2 个类被截断（取决于 teacher softmax top-k），
+# minority 类很可能刚好被删，蒸馏信号丢失。
+GKD_LOGITS_TOPK=${GKD_LOGITS_TOPK:-7}
 # sft_alpha：在非 student 生成的样本上额外混入一份 SFT loss 比例
 #   0.0 = 纯蒸馏；>0 = 蒸馏 + 部分 NLL，作为"硬锚"防止 KL 把学生推歪。
 # 【v13 事故教训】v13 用 sft_alpha=0.5 依然不够——教师(guided)+topk=8 的错向 JSD
@@ -235,10 +414,17 @@ GKD_LOGITS_TOPK=${GKD_LOGITS_TOPK:-5}
 # 一旦被 JSD 拉歪，NLL 项由于 minority 每 batch 出现频率极低，反拉能力不足。
 # 路径 A2 提到 2.0：让 NLL 硬锚权重 2× 于 JSD，压制 JSD 的错向梯度。同时配合
 # balanced 数据集提高 minority class 每 batch 的 NLL 反拉信号。
-SFT_ALPHA=${SFT_ALPHA:-2.0}
+# 【路径 A6】从 2.0 提到 3.0：v5 结果显示 KL 项 (self-distillation 下) 信号弱，
+# CE 才是主信号源；加大 sft_alpha 让 CE 在 loss 里权重更高，配合 minority oversample
+# 共同推进 tail 类学习。
+SFT_ALPHA=${SFT_ALPHA:-3.0}
 # 单条 completion 最长生成多少 token（仅 lmbda>0 时生效）。
-# stepaudio 输出基本是 1 个标签词，给 16 token 足够。
-MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-16}
+# stepaudio 输出基本是 1 个标签词，MELD 最长标签 "surprise"/"sadness"/"disgust"
+# 也在 3-4 token 内；A4 收紧到 8 减轻 on-policy generate 显存压力（lmbda=1.0 每步
+# 都要 student.generate），同时防止学生生成过长序列漂移到音频分支。
+# 【路径 A5】进一步收紧到 6：v4 completions 观察到全部 <= 4 token，8 是过度冗余；
+# 6 依旧远大于最长标签，同时 batch 显存再省 ~25%（generate 阶段主要开销）。
+MAX_COMPLETION_LENGTH=${MAX_COMPLETION_LENGTH:-6}
 # 梯度裁剪
 # 【v14 事故教训】max_grad_norm=1.0 下单个 high-loss batch 就能造成显著位移。
 # 起点已 97.83% 的精修场景下任何大位移都是灾难。路径 A2 收紧到 0.5。
@@ -308,7 +494,13 @@ esac
 # 配合 LR 5e-7（v15 的 5×）让训练真正启动。SAVE_STEPS/EVAL_STEPS=100 每 100 步
 # 一个 ckpt（共 10 个），仍便于外部真实评测挑最优点。若 300 步内 accuracy 掉头
 # 立即 kill 训练。
-MAX_STEPS=${MAX_STEPS:-1000}
+# 【路径 A4】v3 (max_steps=1000) 结果证明 500 步后必塌，A4 直接截到 300 步，
+# 减少 3.3× wall-clock。若 100 步内 macro-F1 就掉头，OPSD_SANITY_ONLY_WARN=1
+# 让训练继续也可以，但更建议立即 kill 换 A5。
+# 【路径 A6】300 → 600（~1.4 epoch）：v5 只跑 0.74 epoch，tail 类（fear/disgust）
+# 重复样本才被看过不到 1 遍；A6 把 training budget 支回到 1.4 epoch 充分学习，
+# 同时保留早停能力（若 macro-F1 在 200-400 step 已接近峰值可手动 kill）。
+MAX_STEPS=${MAX_STEPS:-600}
 
 # checkpointing
 # 【路径 A2 短训练策略】200 步内每 20 步存一个 ckpt (共 10 个)，方便挑最优点。
@@ -319,8 +511,16 @@ MAX_STEPS=${MAX_STEPS:-1000}
 # 一旦 accuracy 掉头（如从 97.83% 跌到 <97%）立即停止训练。
 # 【路径 A3】1000 步 / 每 100 步存一个（共 10 个 ckpt），与 v13/v14 事故经验一致：
 # 短时间内密集存 ckpt + 外部评测挑最优，不依赖 in-training loss。
-SAVE_STEPS=${SAVE_STEPS:-100}
-EVAL_STEPS=${EVAL_STEPS:-100}
+# 【路径 A4】300 步 / 每 25 步存一个（共 12 个 ckpt），比 A3 密度更高，因为：
+#   (a) v3 (A3) 显示 300→500 之间是 macro-F1 上升期，500 之后塌陷，需要在这
+#       个区间密集打点；
+#   (b) on-policy 训练每步真的 sample，个别 batch 可能引入较大噪声位移，密集
+#       存 ckpt 能捕获瞬时最优点。
+# 【路径 A6】SAVE/EVAL_STEPS 25 → 50：600 步 / 50 = 12 个 ckpt（与 A5 相等密度），
+# 避免 600/25=24 个 ckpt 磁盘保存翻倍开销（lora ckpt 小，但训练内 eval 同时
+# 发生会加剧开销）。
+SAVE_STEPS=${SAVE_STEPS:-50}
+EVAL_STEPS=${EVAL_STEPS:-50}
 save_total_limit=${save_total_limit:-100}
 LOGGING_STEPS=${LOGGING_STEPS:-1}
 # GKD trainer 支持 --log_completions（详见 swift/rlhf_trainers/gkd_trainer.py:727）：
@@ -404,8 +604,11 @@ export PYTHONWARNINGS=${PYTHONWARNINGS:-"ignore:TRL currently supports vLLM vers
 #       所有类别的 unique 音频数都在合理区间（不像 balanced 那样 song 复制 19×）。
 # 路径 A2 默认改用 train_softbal.jsonl，兼顾 (1) 分布方向对齐 val (2) minority NLL 反拉
 # (3) 避免过度重复上采样导致的音频指纹过拟合。若要 100% 均衡，仍可 TRAIN_JSONL=... 覆盖。
-DATA_DIR=${DATA_DIR:-"$SCRIPT_DIR/data"}
-TRAIN_JSONL=${TRAIN_JSONL:-"$DATA_DIR/train_softbal.jsonl"}
+DATA_DIR=${DATA_DIR:-"$SCRIPT_DIR/data_meld"}
+# MELD 临时还没有 train_softbal.jsonl (需 balance_train_jsonl.py 生成), 默认
+# 回退到 train.jsonl (原始分布) —— OPSD 本身会通过 hint mode + SFT_ALPHA 平衡,
+# 不一定需要事先均衡。
+TRAIN_JSONL=${TRAIN_JSONL:-"$DATA_DIR/train.jsonl"}
 if [ ! -f "$TRAIN_JSONL" ]; then
     # 【自动派生】train_softbal.jsonl 缺失时自动调用 balance_train_jsonl.py 生成，
     # 而不是直接 exit——用户无需手动预处理，脚本对新机器/新 checkout 自解释。
@@ -473,7 +676,8 @@ fi
 # ---------------- Target-class oversampling（路径 A3 · 建议 5：per-class 加权替代方案）----------------
 # 背景：stepaudio 分类任务 assistant response 只有 1 个 label token，OPSD 里 JSD/CE
 # 都基于该 token 位置的分布计算。理论上应通过 per-class weighted CE（loss_scale）
-# 让 target class（porn）在梯度里获得更大权重来对抗 minority class 的欠学习问题；
+# 让 target class（MELD 版默认 fear，OPSD 五类版默认 porn）在梯度里获得更大权重来
+# 对抗 minority class 的欠学习问题；
 # 但 gkd_trainer 的 self-distillation 分支不消费 loss_scale（详见
 # swift/rlhf_trainers/gkd_trainer.py:_is_self_distillation 分支，只对 outputs.loss
 # 加 sft_alpha 系数，未按样本 mask 加权），因此只能通过**采样加权**近似实现。
@@ -484,37 +688,124 @@ fi
 #   (b) 缺点：会引起同一音频指纹被多次看到（v13 事故观察到的过拟合模式），必须
 #       控制 oversample ratio 上限，避免 balanced 版本那样 19× 复制的极端。
 #
-# 实现：从 SRC=$TRAIN_JSONL（默认 softbal，porn/noise/music/song 各 18-20%）出发，
-# 对 OPSD_TARGET_CLASS 类做等比例复制，把它抬升到 OPSD_TARGET_RATIO（默认 30%），
-# 其他 4 类总量按现状保留，target 类多出来的部分通过重复采样补齐。
-# porn 从 18% → 30% 意味着 porn 样本被复制约 (30/18 - 1) × 原数 = 0.67 倍额外拷贝，
-# 远小于 balanced 版本 14× 复制，音频指纹过拟合风险可控。
+# 实现：从 SRC=$TRAIN_JSONL 出发对 OPSD_TARGET_CLASS 类做等比例复制，把它抬升到
+# OPSD_TARGET_RATIO（默认 30%），其他类总量按现状保留，target 类多出来的部分通过
+# 重复采样补齐。分布参考：
+#   - MELD  train.jsonl (9989 条): neutral 48% / joy 17% / surprise 12% / anger 12% /
+#                                  sadness 7.2% / disgust 2.7% / fear 2.7%
+#   - OPSD  train_softbal.jsonl :  speech 27% / noise 20% / song 18% / porn 18% / music 18%
+# MELD fear 从 2.7% → 30% 意味着 fear 样本要被复制约
+#   (0.30 / 0.027) × (1 - 0.027) / (1 - 0.30) ≈ 15.4 倍，
+# 与 balanced 版本 14× 复制同数量级；v13 事故（14×+ 复制导致音频指纹过拟合）就在
+# 这个区间，务必配合 OPSD_TARGET_RATIO 更保守的值（比如 0.10-0.15）使用。
+# 若沿用 OPSD 五类语境：porn 从 18% → 30% 只需约 0.67 倍额外拷贝，风险远低于 MELD。
 #
 # 触发方式：
-#   OPSD_TARGET_OVERSAMPLE=1 bash run_train_opsd.sh   # 自动派生 & 使用 targeted
-#   OPSD_TARGET_CLASS=porn OPSD_TARGET_RATIO=0.30    # 可覆盖类别与目标占比
+#   OPSD_TARGET_OVERSAMPLE=1 bash run_train_opsd_meld.sh   # 自动派生 & 使用 targeted
+#   OPSD_TARGET_CLASS=fear OPSD_TARGET_RATIO=0.30          # MELD 默认；可覆盖类别与目标占比
+#   （旧 OPSD 五类版对应用例是 OPSD_TARGET_CLASS=porn，此处保留兼容）
 # 关闭方式（默认）：
 #   不设 OPSD_TARGET_OVERSAMPLE 或 =0，走 TRAIN_JSONL 原样。
-OPSD_TARGET_OVERSAMPLE=${OPSD_TARGET_OVERSAMPLE:-0}
-OPSD_TARGET_CLASS=${OPSD_TARGET_CLASS:-porn}
-OPSD_TARGET_RATIO=${OPSD_TARGET_RATIO:-0.30}
+# 【路径 A4】MELD fear/disgust 支持数 ~50-70，一个 epoch 出现 1-2 次，on-policy
+# 采样时 target class 梯度信号几乎为零。默认开启 oversample，同时把 ratio 收紧
+# 到 0.10（fear 从 2.7% → 10%, 约 3.7× 复制，远低于 v13 事故的 14× 阈值），
+# 保证 target class 每 epoch 出现 ~3-4 次而不至于过拟合音频指纹。
+OPSD_TARGET_OVERSAMPLE=${OPSD_TARGET_OVERSAMPLE:-1}
+# 【MELD 版】默认关注 fear（美回归 minority 类, test recall ~0.22），
+# OPSD 五类脚本里默认是 porn；两者语义不通用，请勿沿用旧值。
+# 该变量同时影响 (1) target oversample 的类别; (2) sanity check 的 focus 默认;
+# (3) sanity 内部调 run_eval_meld.sh 时透传的 TARGET_CLASS。
+OPSD_TARGET_CLASS=${OPSD_TARGET_CLASS:-fear}
+# 【路径 A5】多类 oversample。OPSD_TARGET_CLASSES 逗号分隔类名列表，每一个
+# 类都会独立扩容到 OPSD_TARGET_RATIO（等比例复制），共存于同一个训练文件。
+# v4 结果证明单类 oversample（fear）时 disgust/anger 完全没被补齐 → 三类 recall
+# 全部远低于 SFT。默认列出三个 tail 类；若未设置则回退到旧的 OPSD_TARGET_CLASS 单类。
+# 关闭方式：显式设为空 OPSD_TARGET_CLASSES="" 时脚本回退单类语义。
+OPSD_TARGET_CLASSES=${OPSD_TARGET_CLASSES:-fear,disgust,anger}
+# 【路径 A4】ratio 从 0.30 → 0.10：fear 从 2.7% → 10% 已经是 ~3.7× 复制，够每
+# batch 能抽到 fear 样本；0.30 会到 15.4× (见 v13 事故红线 14×)，音频指纹过拟合
+# 风险大。用户需要更激进可手动 OPSD_TARGET_RATIO=0.20 覆盖。
+# 【路径 A5】0.10 → 0.12：v4 只上采 fear 单类，fear R 只涨 2pp，disgust/anger 完全没管；
+# A5 用 OPSD_TARGET_CLASSES 同时上采 fear/disgust/anger 三类，每类目标占比 12%，
+# 主类合计留 64% 空间（neutral 天然是主类，仍占大头）。三类各 ~4-6× 复制，远低
+# 于 v13 事故红线 14×，音频指纹过拟合风险可控。
+OPSD_TARGET_RATIO=${OPSD_TARGET_RATIO:-0.12}
+# 【路径 A6】per-class 目标绝对数（覆盖 OPSD_TARGET_CLASSES/RATIO 的"统一 ratio"策略）。
+# 格式: "cls1=N1,cls2=N2,..."，非空时按此绝对数扩容每个类；为空则回退 A5 逻辑。
+# v5 复盘：A5 的"每类都到 12%"太粗——anger 原本已占 11.1%，扩到 12% 几乎没做上采样
+# (1.3×)；disgust 原本 2.7% 扩到 12% 需要 5.8×，可能过拟合音频指纹；sadness 6.8%
+# 被遗漏。A6 用绝对数，按每类"当前难度 + 支持数 + 音频过拟合红线"定制：
+#   fear    : 268 → 800  (~3.0×  极稀有，需扩容但复制倍数收敛，防音频指纹)
+#   disgust : 271 → 600  (~2.2×  比 A5 的 5.8× 降 62%，缓解 disgust R 上不去的过拟合)
+#   sadness : 683 → 1000 (~1.5×  A5 遗漏，补齐)
+#   anger   : 1109 → 1500 (~1.35×  略补 minority signal)
+# 期望扩容后分布 ≈ neutral 42% / joy 15.6% / anger 13.4% / surprise 10.8% /
+#                sadness 8.9% / fear 7.1% / disgust 5.4%（tail 类不再<3%）。
+# 关闭方式：显式设为空 OPSD_TARGET_COUNTS="" 回退 A5 ratio 逻辑。
+OPSD_TARGET_COUNTS=${OPSD_TARGET_COUNTS:-fear=800,disgust=600,sadness=1000,anger=1500}
+# 【路径 A4】on-policy 漂移事后守护窗口（仅 LMBDA>0 时生效）。
+# 训练结束后扫描 output_dir/completions.jsonl 前 N 行，如果出现 <audio_*> 或
+# <tts_*>/<voice_*> 字符（stepaudio 音频码本分支的标志），报 [WARN][DRIFT]。
+# 0 禁用扫描。方便事后定位漂移，不接管 kill 行为 (kill 需手动判断)。
+OPSD_ONPOLICY_DRIFT_ABORT_STEPS=${OPSD_ONPOLICY_DRIFT_ABORT_STEPS:-50}
 if [ "$OPSD_TARGET_OVERSAMPLE" = "1" ]; then
     _tgt_base=$(basename "$TRAIN_JSONL" .jsonl)
-    TRAIN_JSONL_TARGETED=${TRAIN_JSONL_TARGETED:-"$DATA_DIR/${_tgt_base}.tgt-${OPSD_TARGET_CLASS}-${OPSD_TARGET_RATIO}.jsonl"}
+    # 【路径 A6】优先 OPSD_TARGET_COUNTS (per-class 绝对数)；退化到 A5 的 OPSD_TARGET_CLASSES；再退到 A4 单类
+    if [ -n "$OPSD_TARGET_COUNTS" ]; then
+        _tgt_classes_effective=$(printf '%s' "$OPSD_TARGET_COUNTS" | awk -F',' '{for(i=1;i<=NF;i++){split($i,a,"="); printf (i==1?"":",") a[1]}}')
+        # 文件名 tag：把 "=" 换成 "@"（fs 安全），逗号换成 -
+        _tgt_tag=$(printf '%s' "$OPSD_TARGET_COUNTS" | tr '=' '@' | tr ',' '-')
+        TRAIN_JSONL_TARGETED=${TRAIN_JSONL_TARGETED:-"$DATA_DIR/${_tgt_base}.tgt-${_tgt_tag}.jsonl"}
+        _oversample_mode="counts"
+    else
+        _tgt_classes_effective="${OPSD_TARGET_CLASSES:-$OPSD_TARGET_CLASS}"
+        _tgt_tag=$(printf '%s' "$_tgt_classes_effective" | tr ',' '-')
+        TRAIN_JSONL_TARGETED=${TRAIN_JSONL_TARGETED:-"$DATA_DIR/${_tgt_base}.tgt-${_tgt_tag}-${OPSD_TARGET_RATIO}.jsonl"}
+        _oversample_mode="ratio"
+    fi
     if [ ! -f "$TRAIN_JSONL_TARGETED" ]; then
-        echo "[INFO] 派生 target-class oversampled 训练集: $TRAIN_JSONL_TARGETED"
+        echo "[INFO] 派生 multi-target-class oversampled 训练集 (mode=$_oversample_mode): $TRAIN_JSONL_TARGETED"
+        echo "[INFO]   target_classes = $_tgt_classes_effective"
+        if [ "$_oversample_mode" = "counts" ]; then
+            echo "[INFO]   target_counts  = $OPSD_TARGET_COUNTS"
+        else
+            echo "[INFO]   target_ratio   = $OPSD_TARGET_RATIO (each)"
+        fi
         SRC_JSONL="$TRAIN_JSONL" \
         DST_JSONL="$TRAIN_JSONL_TARGETED" \
-        TARGET_CLASS="$OPSD_TARGET_CLASS" \
+        TARGET_CLASSES="$_tgt_classes_effective" \
         TARGET_RATIO="$OPSD_TARGET_RATIO" \
+        TARGET_COUNTS="$OPSD_TARGET_COUNTS" \
         /data/miniconda3/envs/env-3.12.11/bin/python - <<'PYEOF'
 import json, os, random, sys
 random.seed(42)
 
 SRC = os.environ['SRC_JSONL']
 DST = os.environ['DST_JSONL']
-TARGET_CLASS = os.environ['TARGET_CLASS']
+TARGET_CLASSES = [c.strip() for c in os.environ['TARGET_CLASSES'].split(',') if c.strip()]
 TARGET_RATIO = float(os.environ['TARGET_RATIO'])
+TARGET_COUNTS_RAW = os.environ.get('TARGET_COUNTS', '').strip()
+
+# 【路径 A6】per-class 绝对数模式：解析 "cls=N,cls2=N2,..." 到 dict
+target_counts = {}
+if TARGET_COUNTS_RAW:
+    for kv in TARGET_COUNTS_RAW.split(','):
+        kv = kv.strip()
+        if not kv:
+            continue
+        if '=' not in kv:
+            sys.stderr.write(f'[FATAL] OPSD_TARGET_COUNTS entry missing "=": {kv}\n')
+            sys.exit(1)
+        k, v = kv.split('=', 1)
+        try:
+            target_counts[k.strip()] = int(v.strip())
+        except ValueError:
+            sys.stderr.write(f'[FATAL] OPSD_TARGET_COUNTS N not int: {kv}\n')
+            sys.exit(1)
+
+if not TARGET_CLASSES:
+    sys.stderr.write('[FATAL] TARGET_CLASSES empty after parse\n')
+    sys.exit(1)
 
 def pick_label(d):
     for k in ('label', 'label_str_origin'):
@@ -543,38 +834,52 @@ with open(SRC) as fi:
         buckets.setdefault(lbl, []).append(line)
 
 n_orig = {k: len(v) for k, v in buckets.items()}
-if TARGET_CLASS not in buckets:
-    sys.stderr.write(f'[FATAL] TARGET_CLASS={TARGET_CLASS} not found in dataset. Available: {list(buckets.keys())}\n')
-    sys.exit(1)
 
-# 计算：非 target 类总量固定 = sum(n_orig[c] for c != target) = N_other
-# 目标：n_target_new / (n_target_new + N_other) = TARGET_RATIO
-#   => n_target_new = TARGET_RATIO * N_other / (1 - TARGET_RATIO)
-n_other = sum(v for k, v in n_orig.items() if k != TARGET_CLASS)
-if TARGET_RATIO >= 0.999:
-    sys.stderr.write(f'[FATAL] TARGET_RATIO={TARGET_RATIO} too high (must < 1.0)\n')
-    sys.exit(1)
-n_target_new = int(round(TARGET_RATIO * n_other / (1.0 - TARGET_RATIO)))
+for tc in TARGET_CLASSES:
+    if tc not in buckets:
+        sys.stderr.write(f'[FATAL] TARGET_CLASS={tc} not found in dataset. Available: {list(buckets.keys())}\n')
+        sys.exit(1)
 
-target_pool = buckets[TARGET_CLASS]
-n_target_orig = len(target_pool)
-
-# 复制策略：整数倍复制 + 随机采样补齐
-if n_target_new <= n_target_orig:
-    # 目标比例低于当前——不做任何操作，直接原样输出
-    target_final = list(target_pool)
-    # 但要 truncate 到 n_target_new？— 保留原样避免误删数据
-    target_final = target_pool
+# 计算每个 target 类扩容后目标数量
+target_new_counts = {}
+if target_counts:
+    # 【A6】per-class 绝对数：直接读；未在 target_counts 里但在 TARGET_CLASSES 的类跳过
+    for tc in TARGET_CLASSES:
+        if tc in target_counts:
+            target_new_counts[tc] = target_counts[tc]
+    if not target_new_counts:
+        sys.stderr.write(f'[FATAL] OPSD_TARGET_COUNTS 里没有任何 TARGET_CLASSES 里的类\n')
+        sys.exit(1)
 else:
-    reps = n_target_new // n_target_orig
-    remainder = n_target_new - reps * n_target_orig
-    target_final = target_pool * reps + random.sample(target_pool, remainder)
+    # 【A5 回退】"每类都到 TARGET_RATIO" 模式
+    if TARGET_RATIO >= 0.999:
+        sys.stderr.write(f'[FATAL] TARGET_RATIO={TARGET_RATIO} too high (must < 1.0)\n')
+        sys.exit(1)
+    if TARGET_RATIO * len(TARGET_CLASSES) >= 0.95:
+        sys.stderr.write(f'[FATAL] TARGET_RATIO * K = {TARGET_RATIO}*{len(TARGET_CLASSES)} >= 0.95, no room for majority classes\n')
+        sys.exit(1)
+    n_other = sum(v for k, v in n_orig.items() if k not in TARGET_CLASSES)
+    K = len(TARGET_CLASSES)
+    n_new_each = int(round(TARGET_RATIO * n_other / (1.0 - K * TARGET_RATIO)))
+    for tc in TARGET_CLASSES:
+        target_new_counts[tc] = n_new_each
 
-# 输出：非 target 类原样 + target 类扩容后的池子，全部 shuffle
+target_finals = {}
+for tc, n_target in target_new_counts.items():
+    pool = buckets[tc]
+    n_orig_tc = len(pool)
+    if n_target <= n_orig_tc:
+        target_finals[tc] = list(pool)  # 目标数小于当前，原样保留（不 truncate）
+    else:
+        reps = n_target // n_orig_tc
+        remainder = n_target - reps * n_orig_tc
+        target_finals[tc] = pool * reps + random.sample(pool, remainder)
+
+# 输出：非 target 类原样 + 每个 target 类扩容后池子，全部 shuffle
 lines_out = []
 for k, v in buckets.items():
-    if k == TARGET_CLASS:
-        lines_out.extend(target_final)
+    if k in target_finals:
+        lines_out.extend(target_finals[k])
     else:
         lines_out.extend(v)
 random.shuffle(lines_out)
@@ -584,21 +889,24 @@ with open(DST, 'w') as fo:
         fo.write(line + '\n')
 
 # 打印分布信息
-n_final = {k: (len(target_final) if k == TARGET_CLASS else len(v)) for k, v in buckets.items()}
+n_final = {k: (len(target_finals[k]) if k in target_finals else len(v)) for k, v in buckets.items()}
 total = sum(n_final.values())
+mode_label = 'counts (per-class abs)' if target_counts else f'ratio ({TARGET_RATIO} each)'
 print(f'[OVERSAMPLE] src={SRC}')
-print(f'[OVERSAMPLE] target_class={TARGET_CLASS} target_ratio={TARGET_RATIO}')
+print(f'[OVERSAMPLE] mode={mode_label}  target_classes={list(target_new_counts.keys())}')
 print(f'[OVERSAMPLE] before: total={sum(n_orig.values())} ' + ', '.join(f'{k}={v}({v/sum(n_orig.values())*100:.1f}%)' for k, v in n_orig.items()))
 print(f'[OVERSAMPLE] after : total={total} ' + ', '.join(f'{k}={v}({v/total*100:.1f}%)' for k, v in n_final.items()))
-print(f'[OVERSAMPLE] {TARGET_CLASS} unique={n_target_orig} copies={n_target_new/n_target_orig:.2f}x -> {DST}')
+for tc, n_target in target_new_counts.items():
+    n0 = len(buckets[tc]); n1 = len(target_finals[tc])
+    print(f'[OVERSAMPLE]   {tc}: unique={n0} -> {n1} ({n1/n0:.2f}x, target={n_target})')
+print(f'[OVERSAMPLE] -> {DST}')
 PYEOF
     else
-        echo "[INFO] 复用已存在的 target-class oversampled 训练集: $TRAIN_JSONL_TARGETED"
+        echo "[INFO] 复用已存在的 multi-target-class oversampled 训练集: $TRAIN_JSONL_TARGETED"
     fi
     echo "[INFO] TRAIN_JSONL 切换：$TRAIN_JSONL -> $TRAIN_JSONL_TARGETED"
     TRAIN_JSONL="$TRAIN_JSONL_TARGETED"
 fi
-
 # 沿用 grpo 脚本：用 split_dataset_ratio 切 1% 作为 eval（OPSD 评估只看 ce loss/rouge，
 # 不需要单独维护 val 文件）
 SPLIT_DATASET_RATIO=${SPLIT_DATASET_RATIO:-0.01}
@@ -642,7 +950,7 @@ if [ "$OPSD_HINT_MODE" = "rank" ]; then
     #   - top-4/5 概率 ≈ 0.001~0.03（明显不匹配的 class）
     #   - <tts_*>/<audio_*> 概率 ≈ 0（rank 明确要求输出 5 类之一）
     # 若实际观察到 top-1 ≈ 1.0（塌陷成 one-hot），则 rank 模式失败，回退 direct/guided。
-    OPSD_TEACHER_HINT_TEMPLATE=${OPSD_TEACHER_HINT_TEMPLATE:-$'\n\n(Teacher-only ranking task: for the audio above, rank the 5 candidates {speech, music, noise, porn, song} by likelihood based purely on the audio characteristics — do NOT reveal the ranking, but pick the single most likely candidate as your answer following the required answer format. Assess each candidate holistically without preferring any category by name.)'}
+    OPSD_TEACHER_HINT_TEMPLATE=${OPSD_TEACHER_HINT_TEMPLATE:-$'\n\n(Teacher-only ranking task: for the audio above, rank the 7 candidates {surprise, anger, neutral, joy, sadness, fear, disgust} by likelihood based purely on the vocal / emotional characteristics of the speaker — do NOT reveal the ranking, but pick the single most likely candidate as your answer following the required answer format. Assess each candidate holistically without preferring any category by name.)'}
 elif [ "$OPSD_HINT_MODE" = "direct" ]; then
     # 【路径 A2 备选】把 ground-truth 作为参考告诉教师。
     # 【v14 事故教训 · hint 措辞修正】v14 使用的旧模板：
@@ -663,7 +971,7 @@ elif [ "$OPSD_HINT_MODE" = "direct" ]; then
 else
     # guided：只给"分类框架"，不泄漏答案。⚠ v13 已证实此模式在 stepaudio 上会引发
     # song 偏置崩坏，非有充分把握不要使用；如要使用请重写 hint 消除类别列表锚定。
-    OPSD_TEACHER_HINT_TEMPLATE=${OPSD_TEACHER_HINT_TEMPLATE:-$'\n\n(Teacher hint, do NOT echo: focus on distinguishing among {speech, music, noise, porn, song}. Consider vocal characteristics (speech vs singing), presence of instrumental/melodic content, background noise level, and any explicit sexual audio cues. Output exactly one label following the required answer format.)'}
+    OPSD_TEACHER_HINT_TEMPLATE=${OPSD_TEACHER_HINT_TEMPLATE:-$'\n\n(Teacher hint, do NOT echo: focus on distinguishing among {surprise, anger, neutral, joy, sadness, fear, disgust}. Consider prosody, pitch variance, energy, speech rate, and paralinguistic cues (breathing / voice quality) to infer the speaker\'s emotional state. Output exactly one label following the required answer format.)'}
 fi
 
 # ---------------- 派生带 teacher_prompt 的训练 jsonl ----------------
@@ -793,7 +1101,17 @@ echo "[INFO] gradient_checkpointing=$GC_FLAG log_completions=$LOG_COMPLETIONS"
 echo "[INFO] OPSD beta=$BETA lmbda=$LMBDA temperature=$TEMPERATURE max_completion=$MAX_COMPLETION_LENGTH"
 echo "[INFO] OPSD gkd_logits_topk=${GKD_LOGITS_TOPK:-<full vocab>} sft_alpha=$SFT_ALPHA"
 echo "[INFO] OPSD hint_mode=$OPSD_HINT_MODE (rank=多选题式排序[A3默认], direct=直接给答案[A2], guided=只给分类框架[v13崩坏])"
-echo "[INFO] OPSD target_oversample=$OPSD_TARGET_OVERSAMPLE target_class=$OPSD_TARGET_CLASS target_ratio=$OPSD_TARGET_RATIO"
+echo "[INFO] OPSD target_oversample=$OPSD_TARGET_OVERSAMPLE target_classes=${OPSD_TARGET_CLASSES:-$OPSD_TARGET_CLASS} target_ratio=$OPSD_TARGET_RATIO"
+if [ "$LMBDA" != "0.0" ] && [ "$LMBDA" != "0" ]; then
+    echo "[INFO] 【路径 A6】lmbda=$LMBDA (on-policy) + beta=$BETA (中弱 KL) + lr=$LEARNING_RATE + max_steps=$MAX_STEPS + sft_alpha=$SFT_ALPHA"
+    echo "[INFO]              hint 已修为 MELD 7 类；rank.jsonl hash 变化会自动重建"
+    echo "[INFO]              per-class oversample counts=${OPSD_TARGET_COUNTS:-<disabled, using ratio>}；gkd_logits_topk=$GKD_LOGITS_TOPK 已对齐 7 类"
+    echo "[INFO]              每步学生自采样，训练结束后会扫描前 $OPSD_ONPOLICY_DRIFT_ABORT_STEPS 行 completions.jsonl"
+    echo "[INFO]              检查 <audio_*>/<tts_*> 漂移；若发现漂移已到 macro-F1 重陛系统性奇差阶段，建议中断"
+else
+    echo "[INFO] 【路径 A3 fallback】lmbda=0 (offline) —— KL 项自蒸馏梯度近零，训练等价于 (1-beta)× CE"
+    echo "[INFO]              此时 completions.jsonl 不会产出，无法监控漂移；若想真跑 OPSD 请设 LMBDA=1.0"
+fi
 echo "[INFO] RESUME_CHECKPOINT='${RESUME_CHECKPOINT}'  RESUME_ONLY_MODEL='${RESUME_ONLY_MODEL}'"
 if [ "$OPSD_HINT_MODE" = "rank" ]; then
     echo "[INFO] OPSD_HINT_MODE=rank (路径 A3 · 研究方案)：教师被要求对 5 类做排序，"
@@ -817,7 +1135,7 @@ fi
 if [[ "$MODEL_PATH" == */Step-Audio-2-mini ]]; then
     echo "[WARN] MODEL_PATH 指向 base 模型：base 未做过分类 SFT，OPSD 精修意义不大。"
     echo "       路径 A 强烈建议指向 SFT 后的 checkpoint，例如："
-    echo "         export MODEL_PATH=\$SWIFT_ROOT/output/v16-20260629-162422/checkpoint-1600-merged"
+    echo "         export MODEL_PATH=./output/meld/v0-20260707-182357/checkpoint-234"
     if [ "$LMBDA" != "0.0" ] && [ "$LMBDA" != "0" ]; then
         echo "[WARN] 且 LMBDA>0：base 模型 on-policy 生成极易吐 <audio_XXX> 污染教师，"
         echo "       必须强制 LMBDA=0 或先做 SFT。"
@@ -831,7 +1149,7 @@ if [[ "$MODEL_PATH" == */checkpoint-400-merged ]]; then
     echo "        起点（v15-20260702-150039 事故复盘：val accuracy 仅 ~57%，"
     echo "        noise/porn F1=0，156+ 条无效响应）。"
     echo "        推荐替换为已验证的 checkpoint-1600-merged (accuracy=97.83%)："
-    echo "          export MODEL_PATH=\$SWIFT_ROOT/output/v16-20260629-162422/checkpoint-1600-merged"
+    echo "          export MODEL_PATH=./output/meld/v0-20260707-182357/checkpoint-234"
     echo "        或直接 unset MODEL_PATH 使用脚本默认值。"
     exit 16
 fi
@@ -1032,42 +1350,61 @@ fi
 # 根因是**起点模型本身就已损坏**（自动 merge 出的 checkpoint-400-merged 目录 tokenizer
 # 缺文件），OPSD 200 步只是"忠实维持"了这个损坏的起点，loss 从 0.16 起步且从未真正下降。
 #
-# 为杜绝此类事故，训练开始前先用 val.small.jsonl (1000 条) 对 MODEL_PATH 做一次快速
-# 推理评测（8 卡 DDP 约 2-3 分钟），三级阈值：
+# 【MELD 版关键差异】
+# 本脚本训练的是 MELD 7 分类 (surprise/anger/neutral/joy/sadness/fear/disgust)，
+# 不是 OPSD 通用五类 (speech/music/noise/porn/song)。因此 v15 时代 sanity 用的
+# OPSD 数据集 (data/val.small.jsonl) + noise/porn recall 阈值在 MELD 场景下会
+# 100% 误报：任何 MELD 模型都不认识 noise/porn 这两个词，recall 必然为 0，且
+# 五分类整体 accuracy 只会围绕 speech recall (~0.6) 打转，永远拿不到 0.85。
+# 因此 MELD 版把 sanity 全部指向 MELD 数据 + MELD 关注类 + MELD 水位：
+#   * VAL_JSONL 默认 data_meld/val.small.jsonl (1108 条, dev split)；
+#   * OPSD_SANITY_FOCUS_CLASSES 关注类，逗号分隔；默认 fear (即 OPSD_TARGET_CLASS,
+#     MELD 里 recall 最低 ~0.22 的美回归目标)；
+#   * 阈值参考 v7-checkpoint-150 test 集: accuracy=0.585 / fear_recall=0.22，
+#     并留 15pp 缓冲：soft acc>=0.50, hard acc>=0.35, focus recall>=0.10。
+# 三级阈值：
 #   HARD 阈值（低于此直接 abort）：accuracy 低到明显是"起点崩坏"级别
-#     accuracy      >= OPSD_SANITY_HARD_ACCURACY      (默认 0.5)
+#     accuracy      >= OPSD_SANITY_HARD_ACCURACY      (MELD 默认 0.35)
 #   SOFT 阈值（低于此仅 warn，不 abort）：期望的正常水位
-#     accuracy      >= OPSD_MIN_ACCURACY              (默认 0.85)
-#     noise recall  >= OPSD_MIN_NOISE_RECALL          (默认 0.5)
-#     porn  recall  >= OPSD_MIN_PORN_RECALL           (默认 0.5)
+#     accuracy      >= OPSD_MIN_ACCURACY              (MELD 默认 0.50)
+#     focus recall  >= OPSD_MIN_FOCUS_RECALL          (MELD 默认 0.10, 每个关注类)
 #     n_invalid_response <= OPSD_MAX_INVALID_RESPONSE (默认 50)
-# 若 accuracy > HARD 但 SOFT 未达标 & 存在单类 recall=0（其它类正常），判为"疑似
+# 若 accuracy > HARD 但 SOFT 未达标 & 关注类 recall=0（其它类正常），判为"疑似
 # 推理链路问题"（例如 MAX_NEW_TOKENS 截断、prompt 模板不一致），仅 warn 放行。
+# 【注意】只对"关注类"触发 SUSPECT, 不再对"任意单类"触发——MELD 上 minority 类
+# (fear/disgust/sadness support 只有几十到二百多) 起点 recall=0 是模型倾向问题,
+# 与推理链路无关, 不该误报为链路 bug。
 #
-# 【新增 v16 优化 A+B+C+D】
+# 【历史优化 A+B+C+D】
 #   A) 缓存：以 MODEL_PATH mtime + val.jsonl md5 做 cache key，命中直接读旧结果，
 #      避免每次改超参重跑训练都要重新推理 2-3 分钟；OPSD_SANITY_FORCE_RERUN=1 强制重跑。
 #   B) 诊断：FAIL 时输出 per-class precision/recall/f1 完整表 & 智能判定链路问题。
 #   C) 三级阈值：HARD/SOFT/单类为 0 时的分级处置，避免单点极端值卡住训练。
-#   D) MAX_NEW_TOKENS：从 8 提到 16，与训练侧 MAX_COMPLETION_LENGTH 对齐，避免长
-#      标签词（如 porn_content）被截断导致假阴性。
+#   D) MAX_NEW_TOKENS：默认 2048（与 run_inference_meld.sh 一致），避免 MELD 8 字符
+#      长标签（surprise/sadness/disgust）被截；也对齐 UltraEval-Audio 容许
+#      模型自由生成完整词后字面匹配的 55.47 baseline 口径。
 #
 # 关闭方式：
-#   OPSD_SKIP_SANITY_CHECK=1  bash run_train_opsd.sh   # 完全跳过
-#   OPSD_SANITY_ONLY_WARN=1   bash run_train_opsd.sh   # 只 warn 不 abort
-#   OPSD_SANITY_FORCE_RERUN=1 bash run_train_opsd.sh   # 忽略缓存重跑
-#   FORCE=1                   bash run_train_opsd.sh   # 等价于 SKIP=1
+#   OPSD_SKIP_SANITY_CHECK=1  bash run_train_opsd_meld.sh   # 完全跳过
+#   OPSD_SANITY_ONLY_WARN=1   bash run_train_opsd_meld.sh   # 只 warn 不 abort
+#   OPSD_SANITY_FORCE_RERUN=1 bash run_train_opsd_meld.sh   # 忽略缓存重跑
+#   FORCE=1                   bash run_train_opsd_meld.sh   # 等价于 SKIP=1
 # 若确实希望跳过，务必知道 v15 事故就是因为跳过了这类验证，损失了数十分钟。
 OPSD_SKIP_SANITY_CHECK=${OPSD_SKIP_SANITY_CHECK:-${FORCE:-0}}
 OPSD_SANITY_ONLY_WARN=${OPSD_SANITY_ONLY_WARN:-0}
 OPSD_SANITY_FORCE_RERUN=${OPSD_SANITY_FORCE_RERUN:-0}
-OPSD_MIN_ACCURACY=${OPSD_MIN_ACCURACY:-0.85}
-OPSD_SANITY_HARD_ACCURACY=${OPSD_SANITY_HARD_ACCURACY:-0.5}
-OPSD_MIN_NOISE_RECALL=${OPSD_MIN_NOISE_RECALL:-0.5}
-OPSD_MIN_PORN_RECALL=${OPSD_MIN_PORN_RECALL:-0.5}
+# 【MELD 阈值】相比 OPSD 五类 (SFT 后 accuracy ~0.97) 大幅下调, 参考 v7-ckpt150 test:
+# accuracy 0.585 / fear R 0.22 → soft 0.50, hard 0.35, focus R 0.10 (15pp 缓冲)。
+OPSD_MIN_ACCURACY=${OPSD_MIN_ACCURACY:-0.50}
+OPSD_SANITY_HARD_ACCURACY=${OPSD_SANITY_HARD_ACCURACY:-0.35}
+# MELD 关注类: 逗号分隔, 每个类的 recall 都必须 >= OPSD_MIN_FOCUS_RECALL。
+# 默认取 OPSD_TARGET_CLASS (fear), 与训练侧 target oversample 目标一致；
+# 若想同时监控 disgust/sadness, 例如: OPSD_SANITY_FOCUS_CLASSES=fear,disgust
+OPSD_SANITY_FOCUS_CLASSES=${OPSD_SANITY_FOCUS_CLASSES:-${OPSD_TARGET_CLASSES:-${OPSD_TARGET_CLASS:-fear}}}
+OPSD_MIN_FOCUS_RECALL=${OPSD_MIN_FOCUS_RECALL:-0.10}
 OPSD_MAX_INVALID_RESPONSE=${OPSD_MAX_INVALID_RESPONSE:-50}
-OPSD_SANITY_MAX_NEW_TOKENS=${OPSD_SANITY_MAX_NEW_TOKENS:-16}
-OPSD_SANITY_VAL_JSONL=${OPSD_SANITY_VAL_JSONL:-"$SCRIPT_DIR/data/val.small.jsonl"}
+OPSD_SANITY_MAX_NEW_TOKENS=${OPSD_SANITY_MAX_NEW_TOKENS:-2048}
+OPSD_SANITY_VAL_JSONL=${OPSD_SANITY_VAL_JSONL:-"$SCRIPT_DIR/data_meld/val.small.jsonl"}
 OPSD_SANITY_CACHE_DIR=${OPSD_SANITY_CACHE_DIR:-"$SCRIPT_DIR/infer_results/_sanity_cache"}
 
 if [ "$OPSD_SKIP_SANITY_CHECK" = "1" ]; then
@@ -1086,7 +1423,12 @@ else
     # 用整个 MODEL_PATH 目录树最新 mtime 作为模型指纹（不依赖 stat 具体格式）
     _sanity_model_mtime=$(find "$MODEL_PATH" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
     _sanity_model_mtime=${_sanity_model_mtime:-nomtime}
-    _sanity_key_raw="$MODEL_PATH|$_sanity_model_mtime|$_sanity_val_md5|mnt=$OPSD_SANITY_MAX_NEW_TOKENS"
+    # 【MELD 版】cache key 额外编入 "meld7_uea" 语义标记（UltraEval-Audio 对齐）：
+    # 与旧 OPSD 五类 cache / 旧 MELD non-UEA cache 分离，修改类别列表 / target /
+    # 调用的下游推理脚本（run_inference.sh -> run_inference_meld.sh）时，cache 会自动
+    # 失效，避免命中错语义的旧结果。
+    _sanity_classes_tag="meld7_uea"
+    _sanity_key_raw="$MODEL_PATH|$_sanity_model_mtime|$_sanity_val_md5|mnt=$OPSD_SANITY_MAX_NEW_TOKENS|cls=$_sanity_classes_tag"
     _sanity_key=$(echo -n "$_sanity_key_raw" | md5sum | awk '{print $1}')
     _sanity_cache_summary="$OPSD_SANITY_CACHE_DIR/${_sanity_key}.json"
     _sanity_cache_meta="$OPSD_SANITY_CACHE_DIR/${_sanity_key}.meta"
@@ -1120,14 +1462,31 @@ else
         echo "       MODEL_PATH        = $MODEL_PATH"
         echo "       VAL_JSONL         = $OPSD_SANITY_VAL_JSONL ($(wc -l < "$OPSD_SANITY_VAL_JSONL") 条)"
         echo "       GPUS              = $_sanity_gpus (nproc=$_sanity_nproc)"
-        echo "       MAX_NEW_TOKENS    = $OPSD_SANITY_MAX_NEW_TOKENS  (v16 优化 D：从 8 -> 16 对齐训练侧)"
+        echo "       MAX_NEW_TOKENS    = $OPSD_SANITY_MAX_NEW_TOKENS  (默认 2048，对齐 UltraEval-Audio + 避免长标签截断)"
         echo "       cache_key         = $_sanity_key"
-        echo "       hard threshold    : accuracy>=$OPSD_SANITY_HARD_ACCURACY (低于此 abort)"
-        echo "       soft thresholds   : accuracy>=$OPSD_MIN_ACCURACY, noise_R>=$OPSD_MIN_NOISE_RECALL,"
-        echo "                           porn_R>=$OPSD_MIN_PORN_RECALL, invalid<=$OPSD_MAX_INVALID_RESPONSE"
+        echo "       hard threshold    : accuracy>=$OPSD_SANITY_HARD_ACCURACY (低于此 abort, MELD 起点崩坏线)"
+        echo "       soft thresholds   : accuracy>=$OPSD_MIN_ACCURACY,"
+        echo "                           focus_R>=$OPSD_MIN_FOCUS_RECALL (每个关注类, focus=$OPSD_SANITY_FOCUS_CLASSES),"
+        echo "                           invalid<=$OPSD_MAX_INVALID_RESPONSE"
         echo "       如需跳过：OPSD_SKIP_SANITY_CHECK=1  bash $(basename "$0")"
         echo "       只警告  ：OPSD_SANITY_ONLY_WARN=1   bash $(basename "$0")"
         echo "===================================================================="
+
+        # MELD 版 sanity 直接使用 MELD 专用下游脚本（run_inference_meld.sh / run_eval_meld.sh），
+        # 它们内置 MELD 7 类默认 + UltraEval-Audio 对齐，无需再显式传 CLASSES / HEALTH_CLASSES。
+        # focus 列表首个作为 TARGET_CLASS（threshold sweep 的正类），与 OPSD_TARGET_CLASS 通常一致（fear）。
+        _sanity_target_class="${OPSD_SANITY_FOCUS_CLASSES%%,*}"
+        _sanity_target_class="${_sanity_target_class:-$OPSD_TARGET_CLASS}"
+
+        # 【MELD 版关键】下游必须用 MELD 专用推理/评估脚本，否则会塑陷为 100% neutral：
+        #   run_inference_meld.sh 相比 run_inference.sh 多 3 项 UltraEval-Audio 对齐 (55.47 baseline 关键)：
+        #     (A) 显式注入 --system "You are a helpful assistant." —— 缺失时 acc 会从 55.47 掉20pp；
+        #     (B) MAX_NEW_TOKENS=2048 —— 避免 MELD 8 字符长标签（surprise/sadness/disgust）被截；
+        #     (C) USE_CACHE=false —— 关掉 KV cache 导致的输出漂移（通过 sitecustomize shim monkey-patch）。
+        #   上一版 sanity 调 run_inference.sh 拿到 accuracy=0.423 / 100% neutral，就是因为缺少这 3 项。
+        #   run_eval_meld.sh 内置 MELD 7 类默认，使用 eval_classification_meld.py（直接兼容 threshold sweep）。
+        # 因此下面不再显式传 HEALTH_CLASSES / CLASSES（MELD 专用脚本默认已是 MELD 7 类），
+        # 只透传 TARGET_CLASS（从 focus 首类取）以对齐 threshold sweep 目标类。
 
         # 关闭 set -e 局部区间：sanity check 由我们自己判定退出码
         set +e
@@ -1137,7 +1496,7 @@ else
         NPROC_PER_NODE="$_sanity_nproc" \
         CUDA_VISIBLE_DEVICES="$_sanity_gpus" \
         MAX_NEW_TOKENS="$OPSD_SANITY_MAX_NEW_TOKENS" \
-        bash "$SCRIPT_DIR/run_inference.sh"
+        bash "$SCRIPT_DIR/run_inference_meld.sh"
         _sanity_infer_rc=$?
         set -e
         if [ "$_sanity_infer_rc" -ne 0 ]; then
@@ -1149,11 +1508,12 @@ else
         RESULT_PATH="$_sanity_result" \
         VAL_JSONL="$OPSD_SANITY_VAL_JSONL" \
         OUTPUT_DIR="$_sanity_eval_dir" \
-        bash "$SCRIPT_DIR/run_eval.sh"
+        TARGET_CLASS="$_sanity_target_class" \
+        bash "$SCRIPT_DIR/run_eval_meld.sh"
         _sanity_eval_rc=$?
         set -e
         if [ "$_sanity_eval_rc" -ne 0 ]; then
-            echo "[FATAL] sanity check 评估失败 (rc=$_sanity_eval_rc)，请检查 eval_classification.py 是否可用。"
+            echo "[FATAL] sanity check 评估失败 (rc=$_sanity_eval_rc)，请检查 eval_classification_meld.py 是否可用。"
             exit 17
         fi
 
@@ -1182,17 +1542,18 @@ else
         _PY_BIN=$(command -v python3 || command -v python)
     fi
 
-    # ---- (B)(C) 三级阈值判定 + 完整诊断信息 ----
+    # ---- (B)(C) 三级阈值判定 + 完整诊断信息 (MELD 版：关注类可配置) ----
     set +e
     "$_PY_BIN" - "$_sanity_summary" \
-        "$OPSD_MIN_ACCURACY" "$OPSD_MIN_NOISE_RECALL" \
-        "$OPSD_MIN_PORN_RECALL" "$OPSD_MAX_INVALID_RESPONSE" \
+        "$OPSD_MIN_ACCURACY" "$OPSD_SANITY_FOCUS_CLASSES" \
+        "$OPSD_MIN_FOCUS_RECALL" "$OPSD_MAX_INVALID_RESPONSE" \
         "$OPSD_SANITY_HARD_ACCURACY" "$OPSD_SANITY_ONLY_WARN" <<'PY'
 import json, sys
 summary_path  = sys.argv[1]
 min_acc       = float(sys.argv[2])
-min_noise_r   = float(sys.argv[3])
-min_porn_r    = float(sys.argv[4])
+# 关注类列表, 逗号分隔; 每个类的 recall 都必须 >= min_focus_recall
+focus_classes = [c.strip() for c in sys.argv[3].split(',') if c.strip()]
+min_focus_r   = float(sys.argv[4])
 max_invalid   = int(sys.argv[5])
 hard_acc      = float(sys.argv[6])
 only_warn     = sys.argv[7] == "1"
@@ -1202,15 +1563,25 @@ with open(summary_path) as f:
 report    = d.get('multiclass_report', {})
 acc       = float(report.get('accuracy', 0.0))
 per       = report.get('per_class', {})
-noise_r   = float(per.get('noise', {}).get('recall', 0.0))
-porn_r    = float(per.get('porn',  {}).get('recall', 0.0))
 n_invalid = int(d.get('n_invalid_response', 0))
+
+# 关注类若在 per-class 报告里缺失 (例如拼写错或 val 集里没这个类), 直接告警
+# 并按 recall=0 处理; 用户可通过 OPSD_SANITY_FOCUS_CLASSES 显式修正。
+focus_recalls = {}
+for c in focus_classes:
+    if c not in per:
+        print(f"[SANITY][WARN] focus class {c!r} 不在 per_class 报告里 "
+              f"(可选: {sorted(per.keys())}); 请检查 OPSD_SANITY_FOCUS_CLASSES 拼写。",
+              file=sys.stderr)
+        focus_recalls[c] = 0.0
+    else:
+        focus_recalls[c] = float(per[c].get('recall', 0.0))
 
 # ---- 打印核心指标 ----
 print("[SANITY] ---- summary ----")
 print(f"[SANITY] accuracy      = {acc:.4f}   (soft>={min_acc}, hard>={hard_acc})")
-print(f"[SANITY] noise recall  = {noise_r:.4f}   (soft>={min_noise_r})")
-print(f"[SANITY] porn  recall  = {porn_r:.4f}   (soft>={min_porn_r})")
+for c, r in focus_recalls.items():
+    print(f"[SANITY] {c:<9s} recall= {r:.4f}   (soft>={min_focus_r}, focus class)")
 print(f"[SANITY] invalid_resp  = {n_invalid}      (soft<={max_invalid})")
 
 # ---- (B) 打印 per-class 完整表 ----
@@ -1222,28 +1593,33 @@ if per:
         r  = float(m.get('recall', 0.0))
         f1 = float(m.get('f1', m.get('f1-score', 0.0)))
         sp = int(m.get('support', 0))
-        print(f"[SANITY] {cls:<12s} {p:>10.4f} {r:>10.4f} {f1:>10.4f} {sp:>10d}")
+        marker = ' <-- focus' if cls in focus_classes else ''
+        print(f"[SANITY] {cls:<12s} {p:>10.4f} {r:>10.4f} {f1:>10.4f} {sp:>10d}{marker}")
 
 # ---- 判定 ----
 soft_failed = []
 if acc < min_acc:
     soft_failed.append(f"accuracy {acc:.4f} < {min_acc}")
-if noise_r < min_noise_r:
-    soft_failed.append(f"noise_recall {noise_r:.4f} < {min_noise_r}")
-if porn_r < min_porn_r:
-    soft_failed.append(f"porn_recall {porn_r:.4f} < {min_porn_r}")
+for c, r in focus_recalls.items():
+    if r < min_focus_r:
+        soft_failed.append(f"{c}_recall {r:.4f} < {min_focus_r}")
 if n_invalid > max_invalid:
     soft_failed.append(f"n_invalid_response {n_invalid} > {max_invalid} (词表异常? <tts_end>/<audio_*>)")
 
 # 硬阈值：accuracy 极低 = 起点模型确实崩了
 hard_failed = acc < hard_acc
 
-# 智能诊断：单类 recall=0 而其它类接近正常 => 疑似链路问题
-zero_classes = [cls for cls, m in per.items() if float(m.get('recall', 0.0)) == 0.0 and int(m.get('support', 0)) > 0]
-nonzero_classes = [cls for cls, m in per.items() if float(m.get('recall', 0.0)) > 0.5]
+# 智能诊断：仅当**关注类** recall=0 且**其它非关注类**明显在工作 (>0.5) 时，
+# 才判为疑似推理链路问题。这样避免 MELD 上 fear/disgust 这类 minority 类天然
+# recall=0 被误报为链路 bug (它们本来就是模型难分的类, 不是推理链路问题)。
+zero_focus = [c for c, r in focus_recalls.items() if r == 0.0]
+nonzero_others = [
+    cls for cls, m in per.items()
+    if cls not in focus_classes and float(m.get('recall', 0.0)) > 0.5
+]
 suspect_pipeline = (
-    len(zero_classes) > 0
-    and len(nonzero_classes) > 0
+    len(zero_focus) > 0
+    and len(nonzero_others) > 0
     and acc >= hard_acc
 )
 
@@ -1261,13 +1637,13 @@ if hard_failed:
     sys.exit(2)  # rc=2: 硬失败
 
 if suspect_pipeline:
-    print(f"[SANITY][SUSPECT] 单类 recall=0 (类={zero_classes}) 但其它类正常 (类={nonzero_classes})", file=sys.stderr)
+    print(f"[SANITY][SUSPECT] 关注类 recall=0 (类={zero_focus}) 但非关注类正常 (类={nonzero_others})", file=sys.stderr)
     print("[SANITY]           且 accuracy {:.4f} >= 硬阈值 {}，判为**疑似推理链路问题**：".format(acc, hard_acc), file=sys.stderr)
-    print("[SANITY]   (a) run_inference.sh 的 MAX_NEW_TOKENS 是否被消费？（本次已设为", file=sys.stderr)
+    print("[SANITY]   (a) run_inference_meld.sh 的 MAX_NEW_TOKENS 是否被消费？（本次已设为", file=sys.stderr)
     print("[SANITY]       $OPSD_SANITY_MAX_NEW_TOKENS，若 script 内被硬编码为更小值，会截断长标签词）", file=sys.stderr)
-    print("[SANITY]   (b) prompt 模板是否与训练时一致？（system / user 顺序、特殊 token）", file=sys.stderr)
+    print("[SANITY]   (b) prompt 模板是否与训练时一致？UltraEval-Audio 对齐需要 --system \"You are a helpful assistant.\" + use_cache=False", file=sys.stderr)
     print("[SANITY]   (c) generation_config 是否引入了 do_sample / temperature 差异？", file=sys.stderr)
-    print("[SANITY]   建议：先跑一次 run_inference.sh + run_eval.sh 手动核验；若确认起点已在", file=sys.stderr)
+    print("[SANITY]   建议：先跑一次 run_inference_meld.sh + run_eval_meld.sh 手动核验；若确认起点已在", file=sys.stderr)
     print("[SANITY]         其它渠道验证过，可 OPSD_SKIP_SANITY_CHECK=1 或 OPSD_SANITY_ONLY_WARN=1。", file=sys.stderr)
 
 print("[SANITY][FAIL:SOFT] " + "; ".join(soft_failed), file=sys.stderr)
@@ -1290,17 +1666,18 @@ PY
         [ "$_sanity_from_cache" = "1" ] && echo "        （本次结果来自缓存，如怀疑缓存过时：OPSD_SANITY_FORCE_RERUN=1）"
         echo "        常见处置："
         echo "          1) 换用已验证的 checkpoint（例如 checkpoint-1600-merged / checkpoint-2000-merged）："
-        echo "             export MODEL_PATH=\$SWIFT_ROOT/output/v16-20260629-162422/checkpoint-1600-merged"
+        echo "             export MODEL_PATH=./output/meld/v0-20260707-182357/checkpoint-234"
         echo "          2) 若怀疑 merge 出错，可 rm -rf 该 -merged 目录后重跑；本脚本会用当前"
         echo "             swift 环境重新 merge 并做完整性检查。"
         echo "          3) 若日志出现 [SANITY][SUSPECT]（疑似推理链路问题），先手动核验："
         echo "             MODEL_PATH=$MODEL_PATH VAL_JSONL=$OPSD_SANITY_VAL_JSONL \\"
-        echo "               MAX_NEW_TOKENS=32 bash \$SCRIPT_DIR/run_inference.sh"
+        echo "               MAX_NEW_TOKENS=2048 bash \$SCRIPT_DIR/run_inference_meld.sh"
         echo "          4) 若确认起点已在其它推理链路验证过，直接跳过或只 warn："
         echo "             OPSD_SKIP_SANITY_CHECK=1 bash $(basename "$0")"
         echo "             OPSD_SANITY_ONLY_WARN=1  bash $(basename "$0")   # 保留检查但不阻塞"
-        echo "          5) 若确实需要下调阈值（不推荐），例如："
-        echo "             OPSD_MIN_ACCURACY=0.7 OPSD_MIN_NOISE_RECALL=0.3 OPSD_MIN_PORN_RECALL=0.3 bash $(basename "$0")"
+        echo "          5) 若确实需要下调阈值（不推荐），MELD 版例如："
+        echo "             OPSD_MIN_ACCURACY=0.45 OPSD_MIN_FOCUS_RECALL=0.05 bash $(basename "$0")"
+        echo "             OPSD_SANITY_FOCUS_CLASSES=fear,disgust bash $(basename "$0")  # 换关注类"
         echo "          6) 强制忽略缓存重跑（若怀疑 MODEL_PATH 已更新但缓存未失效）："
         echo "             OPSD_SANITY_FORCE_RERUN=1 bash $(basename "$0")"
         exit 17
@@ -1327,6 +1704,32 @@ if [ "$TUNER_TYPE" = "lora" ]; then
         --target_modules "${_tm_array[@]}"
     )
 fi
+
+# ---------------- 组装冻结参数 (借鉴 SFT-full v2) ----------------
+FREEZE_LIST=()
+if [ "$FREEZE_EMBED_LMHEAD" = "true" ] || [ "$FREEZE_EMBED_LMHEAD" = "True" ]; then
+    # StepAudio2 沿用 Qwen2 结构, embedding=model.embed_tokens, 输出=lm_head
+    FREEZE_LIST+=(model.embed_tokens lm_head)
+fi
+if [ -n "$EXTRA_FREEZE_PREFIXES" ]; then
+    for p in $EXTRA_FREEZE_PREFIXES; do
+        FREEZE_LIST+=("$p")
+    done
+fi
+FREEZE_ARGS=()
+if [ ${#FREEZE_LIST[@]} -gt 0 ]; then
+    FREEZE_ARGS+=(--freeze_parameters "${FREEZE_LIST[@]}")
+    echo "[INFO] FREEZE_PARAMETERS = ${FREEZE_LIST[*]}"
+else
+    echo "[INFO] FREEZE_PARAMETERS = <none> (未冻结 embedding/lm_head, OPSD 训练易漂; 建议 FREEZE_EMBED_LMHEAD=true)"
+fi
+# 传入 vit / aligner / llm 三档冻结开关 (swift 原生支持)
+FREEZE_ARGS+=(
+    --freeze_vit "$FREEZE_VIT"
+    --freeze_aligner "$FREEZE_ALIGNER"
+    --freeze_llm "$FREEZE_LLM"
+)
+echo "[INFO] FREEZE_VIT=$FREEZE_VIT  FREEZE_ALIGNER=$FREEZE_ALIGNER  FREEZE_LLM=$FREEZE_LLM  LABEL_SMOOTHING=$LABEL_SMOOTHING"
 
 DS_ARGS=()
 if [ -n "$DEEPSPEED_STAGE" ]; then
@@ -1365,13 +1768,18 @@ if [ -n "$RESUME_ONLY_MODEL" ]; then
 fi
 
 # ---------------- 启动 OPSD 训练 ----------------
+# 【路径 A4】训练命令后额外捕获返回码 → 事后 completions.jsonl 漂移扫描。
+# swift rlhf 里面本身会处理 SIGINT/SIGTERM，此处不拦截；只在它退出后做事后体检。
+set +e
 NPROC_PER_NODE=$NPROC_PER_NODE \
 "${SWIFT_CMD[@]}" rlhf \
     --rlhf_type gkd \
     --model "$MODEL_PATH" \
     --model_type step_audio2_mini \
+    --system "$SYSTEM" \
     "${TEACHER_ARGS[@]}" \
     "${TUNER_ARGS[@]}" \
+    "${FREEZE_ARGS[@]}" \
     "${DS_ARGS[@]}" \
     --use_vllm false \
     --dataset "$TRAIN_JSONL_FOR_SWIFT" \
@@ -1389,6 +1797,7 @@ NPROC_PER_NODE=$NPROC_PER_NODE \
     --max_length $MAX_LENGTH \
     --max_completion_length $MAX_COMPLETION_LENGTH \
     --truncation_strategy $TRUNCATION_STRATEGY \
+    --label_smoothing_factor $LABEL_SMOOTHING \
     --beta $BETA \
     --lmbda $LMBDA \
     --temperature $TEMPERATURE \
@@ -1413,5 +1822,49 @@ NPROC_PER_NODE=$NPROC_PER_NODE \
     --log_completions $LOG_COMPLETIONS \
     --seed 42 \
     "$@"
+_opsd_train_rc=$?
 
-echo "[INFO] OPSD 后训练完成，Checkpoint 保存在: $OUTPUT_DIR"
+# ---------------- 【路径 A4】on-policy 漂移事后扫描 ----------------
+# 目的：在训练行将结束时快速定位"前 N 步内学生就已漂到音频/tts 分支"的事故。
+# 不会抠前中断训练（那需要侵入式的 trainer callback，本轮不做），仅做事后报警。
+# 启动条件：OPSD_ONPOLICY_DRIFT_ABORT_STEPS>0 且 LMBDA 非零（只有 on-policy 才会产生 completions.jsonl）。
+# 注意：整段包在外层 set +e 内（尚未恢复），扫描内命令报错不会 abort 主脚本。
+if [ "${OPSD_ONPOLICY_DRIFT_ABORT_STEPS:-0}" -gt 0 ] 2>/dev/null \
+    && [ "$LMBDA" != "0.0" ] && [ "$LMBDA" != "0" ]; then
+    _comp_file="$OUTPUT_DIR/completions.jsonl"
+    # swift 可能自动追加版本子目录 (add_version=true)；递归找第一个 completions.jsonl
+    if [ ! -f "$_comp_file" ]; then
+        _comp_file=$(find "$OUTPUT_DIR" -maxdepth 4 -name completions.jsonl -type f 2>/dev/null | head -1)
+    fi
+    if [ -n "$_comp_file" ] && [ -f "$_comp_file" ]; then
+        _drift_hits=$(head -n "$OPSD_ONPOLICY_DRIFT_ABORT_STEPS" "$_comp_file" 2>/dev/null \
+            | grep -cE '<audio_|<tts_|<voice_' || true)
+        echo ""
+        echo "================ [路径 A4 drift check] ================"
+        echo "[INFO] completions.jsonl        = $_comp_file"
+        echo "[INFO] 扫描前 $OPSD_ONPOLICY_DRIFT_ABORT_STEPS 行内 <audio_*>/<tts_*>/<voice_*> 命中 = $_drift_hits"
+        if [ "${_drift_hits:-0}" -gt 0 ]; then
+            echo "[WARN][DRIFT] 前期 on-policy 采样已漂向音频码本分支，训练结果大概率失效。"
+            echo "[WARN][DRIFT] 前 3 条面目："
+            grep -m 3 -E '<audio_|<tts_|<voice_' "$_comp_file" 2>/dev/null \
+                | head -3 \
+                | sed 's/^/[WARN][DRIFT]   /'
+            echo "[WARN][DRIFT] 建议："
+            echo "[WARN][DRIFT]   1) 下调 LMBDA (例如 0.3-0.5) 降低学生采样占比；"
+            echo "[WARN][DRIFT]   2) 或回退 LMBDA=0.0 (路径 A3 fallback，失去真 on-policy)；"
+            echo "[WARN][DRIFT]   3) 检查 MODEL_PATH 是否真的是 SFT 后 ckpt (base 直接 on-policy 必崩)。"
+        else
+            echo "[INFO] 前期采样干净，无 <audio_*>/<tts_*>/<voice_*> 漂移信号。"
+        fi
+        echo "==========================================================="
+    else
+        echo "[WARN][DRIFT] 未找到 completions.jsonl (可能 LOG_COMPLETIONS=false 或训练未完成)，跳过漂移扫描。"
+    fi
+    unset _comp_file _drift_hits
+fi
+
+if [ "${_opsd_train_rc:-0}" -ne 0 ]; then
+    echo "[WARN] swift rlhf 退出码 non-zero: $_opsd_train_rc (训练可能未完成)"
+fi
+
+echo "[INFO] MELD OPSD 后训练完成，Checkpoint 保存在: $OUTPUT_DIR"

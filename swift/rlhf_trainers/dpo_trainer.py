@@ -134,7 +134,10 @@ class DPOTrainer(RLHFTrainerMixin, SwiftMixin, DataLoaderMixin, HFDPOTrainer):
         loss_types = self.loss_type if isinstance(self.loss_type, list) else [self.loss_type]
         if 'ipo' in loss_types:
             size_completion = loss_mask.sum(dim=-1)
-            per_token_logps = per_token_logps / size_completion
+            # bugfix: per_token_logps is [B, T], size_completion is [B];
+            # must unsqueeze to [B, 1] to broadcast along T. Without unsqueeze,
+            # torch broadcasts by aligning the last dim -> crashes whenever T != B.
+            per_token_logps = per_token_logps / size_completion.clamp(min=1).unsqueeze(-1)
 
         output = {}
         if self.template.padding_free:

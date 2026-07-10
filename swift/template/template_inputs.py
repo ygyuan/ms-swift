@@ -111,6 +111,8 @@ class StdTemplateInputs:
             content = message['content']
             if isinstance(content, str):
                 continue
+            elif content is None:
+                continue
             elif (isinstance(content, list) and content
                   and isinstance(content[0], int)) or (isinstance(content, dict) and 'token_ids' in content):
                 continue

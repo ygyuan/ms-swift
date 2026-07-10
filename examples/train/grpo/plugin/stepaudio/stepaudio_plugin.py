@@ -360,8 +360,434 @@ class StepAudioAccuracyWeighted(ORM):
             rewards.append(self._weight_for(gt) if ok else 0.0)
         return rewards
 
+# --------------------------------------------------------------------------- #
+# Recall-aware reward: penalize "lazy majority prediction".
+# --------------------------------------------------------------------------- #
+# Motivation
+# ----------
+# GRPO v0 on MELD collapsed to over-predicting `neutral` (majority): even after
+# switching to weighted accuracy, the *only* way for GRPO to lose reward on a
+# rare-class rollout is "not perfectly matching gt", so the policy learned the
+# safe strategy "always guess neutral -- majority classes will still hit, and
+# the rare-class group std tends to be small enough that gradients don't fight
+# back". The training-time neutral over-prediction rose from 70.8% (SFT) to
+# 82.3% (GRPO-200), and disgust recall collapsed from 45.6% to 11.8%.
+#
+# The plain fix is asymmetric: keep the positive reward path exactly as
+# `stepaudio_accuracy_weighted`, but add a *negative* reward when the policy
+# tries to hedge with `neutral` (or any configured "lazy" label) while the gt
+# is a rare class. Concretely:
+#
+#   reward =  w[gt]                            if pred == gt   (positive path)
+#         =  -lazy_penalty                     if pred in LAZY and gt not in LAZY
+#         =  0.0                               otherwise
+#
+# Design choices:
+#   * We do NOT penalize the LAZY class when it *is* the ground-truth --- that
+#     would break majority learning entirely. This asymmetry is the whole
+#     point: we only punish "guessing neutral when the truth is not neutral".
+#   * We do NOT penalize other wrong predictions (e.g. gt=anger, pred=joy) with
+#     -lazy_penalty --- those are honest mistakes, they already earn 0.0 and
+#     shouldn't be pulled further below by this term. Only the hedging
+#     behaviour is targeted.
+#   * The magnitude of the penalty is configurable via
+#         STEPAUDIO_LAZY_PENALTY (default 0.5)
+#     and the set of "lazy" labels via
+#         STEPAUDIO_LAZY_LABELS   (default "neutral")
+#     Both can be sweeped without editing code.
+#
+# Backwards compat: this is a NEW reward name (`stepaudio_accuracy_recall`);
+# existing three rewards are untouched. Turn it on by adding to your shell:
+#     REWARD_FUNCS="stepaudio_accuracy_recall"
+# --------------------------------------------------------------------------- #
+
+def _parse_lazy_labels_env() -> set:
+    """Parse STEPAUDIO_LAZY_LABELS='neutral,other' -> set of lowercase labels.
+
+    Empty / missing env var falls back to {'neutral'}. Silent on parse error
+    (fall back to default) but prints a warning to trainer logs.
+    """
+    raw = _os.environ.get('STEPAUDIO_LAZY_LABELS', '').strip()
+    if not raw:
+        return {'neutral'}
+    try:
+        out = set()
+        for tok in raw.split(','):
+            tok = tok.strip().lower()
+            if tok:
+                out.add(tok)
+        return out or {'neutral'}
+    except Exception as e:  # pragma: no cover
+        print(f'[WARN] STEPAUDIO_LAZY_LABELS parse failed ({e!r}); '
+              f'falling back to {{neutral}}', flush=True)
+        return {'neutral'}
+
+def _parse_lazy_penalty_env() -> float:
+    """Parse STEPAUDIO_LAZY_PENALTY float. Default 0.5.
+
+    Values <=0 effectively disable the penalty (equivalent to
+    stepaudio_accuracy_weighted).
+    """
+    raw = _os.environ.get('STEPAUDIO_LAZY_PENALTY', '').strip()
+    if not raw:
+        return 0.5
+    try:
+        v = float(raw)
+        if v < 0:
+            print(f'[WARN] STEPAUDIO_LAZY_PENALTY={v} < 0; taking abs value.', flush=True)
+            v = abs(v)
+        return v
+    except Exception as e:  # pragma: no cover
+        print(f'[WARN] STEPAUDIO_LAZY_PENALTY parse failed ({e!r}); using 0.5', flush=True)
+        return 0.5
+
+def _parse_lazy_strict_env() -> bool:
+    """Parse STEPAUDIO_LAZY_STRICT bool. Default False.
+
+    When STRICT=False (default, backwards-compatible):
+        pred in LAZY and gt NOT in LAZY   -> -penalty
+        pred in LAZY and gt IN LAZY (mismatch, e.g. gt=neutral,pred=joy) -> 0.0
+    When STRICT=True (v4+):
+        pred in LAZY and pred != gt       -> -penalty  (regardless of gt in LAZY)
+    Rationale: v3 on MELD showed 'joy explosion' (recall 34.6 -> 48.5) because
+    with LAZY={neutral,joy} the non-strict rule exempts gt=neutral,pred=joy from
+    penalty (gt is in LAZY so we skip). joy therefore steals mass from neutral
+    at zero cost. STRICT mode closes this loophole: any LAZY prediction that
+    doesn't match gt is penalized, forcing policy to only pick LAZY labels when
+    the GT actually is that LAZY label.
+    """
+    raw = _os.environ.get('STEPAUDIO_LAZY_STRICT', '').strip().lower()
+    if not raw:
+        return False
+    return raw in ('1', 'true', 'yes', 'on')
+
+class StepAudioAccuracyRecall(ORM):
+    """Asymmetric class-weighted reward that also punishes lazy majority guesses.
+
+    Non-strict mode (STEPAUDIO_LAZY_STRICT=0, default; backwards compatible):
+      * pred == gt:                                reward = w[gt]      (positive)
+      * pred in LAZY_LABELS and gt not in LAZY:    reward = -penalty
+      * any other mismatch:                        reward = 0.0
+      * gt unknown / empty:                        reward = 0.0
+
+    Strict mode (STEPAUDIO_LAZY_STRICT=1, v4+; closes symmetric-exemption bug):
+      * pred == gt:                                reward = w[gt]      (positive)
+      * pred in LAZY_LABELS and pred != gt:        reward = -penalty   (NEW)
+      * any other mismatch:                        reward = 0.0
+      * gt unknown / empty:                        reward = 0.0
+    Note: in strict mode, gt=joy,pred=neutral is penalized (since neutral is
+    LAZY and pred != gt). This is intentional: it suppresses the reverse
+    hedging direction too. But pred=neutral when gt=neutral remains
+    correct-path (+w[gt]), so majority learning is preserved.
+
+    Env vars (see module docstring above):
+        STEPAUDIO_CLASS_WEIGHTS    (same schema as StepAudioAccuracyWeighted)
+        STEPAUDIO_LAZY_LABELS      comma-separated, default "neutral"
+        STEPAUDIO_LAZY_PENALTY     float, default 0.5
+        STEPAUDIO_LAZY_STRICT      bool (0/1), default 0
+
+    Compatibility notes:
+      * Rewards can be negative here, which is fine for GRPO advantage
+        computation --- the trainer computes (r - mean)/std within each group,
+        so a negative baseline just shifts the origin, it doesn't break
+        anything. The only place negative rewards care is
+        `scale_rewards=none`: they DO flow directly into the loss then, which
+        is exactly what we want (majority-hedging directly hurts).
+      * With `scale_rewards=group`, the -penalty term is partially normalized
+        away when all 8 rollouts in a group are LAZY guesses (std=0 for the
+        penalty component). If you rely on this reward, prefer
+        `scale_rewards=none` or `scale_rewards=batch`.
+    """
+
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+        except TypeError:
+            super().__init__()
+        self._weights = {k.lower(): float(v) for k, v in _parse_class_weights_env().items()}
+        self._lazy_labels = _parse_lazy_labels_env()
+        self._lazy_penalty = _parse_lazy_penalty_env()
+        self._lazy_strict = _parse_lazy_strict_env()
+        print(
+            f'[StepAudioAccuracyRecall] class_weights={self._weights} '
+            f'lazy_labels={sorted(self._lazy_labels)} lazy_penalty={self._lazy_penalty} '
+            f'lazy_strict={self._lazy_strict}',
+            flush=True,
+        )
+
+    def _weight_for(self, label: str) -> float:
+        if not label:
+            return 1.0
+        return float(self._weights.get(label.lower(), 1.0))
+
+    def __call__(
+        self,
+        completions: List[str],
+        solution: Optional[List[str]] = None,
+        label: Optional[List[str]] = None,
+        messages: Optional[List] = None,
+        instruction: Optional[List[str]] = None,
+        **kwargs,
+    ) -> List[float]:
+        gts = label if label is not None else solution
+        n = len(completions)
+        if gts is None:
+            gts = [''] * n
+        if messages is None:
+            messages = [None] * n
+        if instruction is None:
+            instruction = [None] * n
+
+        rewards: List[float] = []
+        for i in range(n):
+            completion = completions[i] or ''
+            gt = _normalize_gt(gts[i])
+            prompt_text = _get_prompt_text(messages[i], instruction[i])
+            labels = _parse_labels_from_prompt(prompt_text)
+            if gt and gt not in labels:
+                labels.append(gt)
+            pred = _predict_label(completion, labels)
+            gt_low = gt.lower() if gt else ''
+            pred_low = pred.lower() if pred else ''
+
+            if gt_low and pred_low == gt_low:
+                # correct -> positive class-weighted reward
+                rewards.append(self._weight_for(gt))
+            elif pred_low in self._lazy_labels and gt_low and pred_low != gt_low and (
+                    self._lazy_strict or gt_low not in self._lazy_labels):
+                # v4: STRICT mode drops the "gt in LAZY" exemption to close the
+                # symmetric-exemption bug (e.g. gt=neutral,pred=joy now penalized
+                # even though gt is also in LAZY). Non-strict keeps the original
+                # "gt not in LAZY" filter for backwards compatibility.
+                rewards.append(-self._lazy_penalty)
+            else:
+                # honest miss / unknown gt -> zero (matches baseline behaviour)
+                rewards.append(0.0)
+        return rewards
 
 # Register into swift's ORM registry so that --reward_funcs can find them.
 orms['stepaudio_accuracy'] = StepAudioAccuracy
 orms['stepaudio_format'] = StepAudioFormat
 orms['stepaudio_accuracy_weighted'] = StepAudioAccuracyWeighted
+orms['stepaudio_accuracy_recall'] = StepAudioAccuracyRecall
+
+# --------------------------------------------------------------------------- #
+# Transcript-WER reward: reward the model for accurate self-transcription.
+# --------------------------------------------------------------------------- #
+# Motivation
+# ----------
+# The r1omni_self_asr data format asks the model to first transcribe the
+# audio inside <transcript>...</transcript> and only then emit the emotion
+# label inside <answer>...</answer>. Empirically (MELD test on v10/v11 SFT),
+# giving the model *external* ASR text lifts accuracy by ~10pp (from 59% to
+# 69%) -- meaning the ASR content itself carries strong emotion signal. We
+# therefore want the GRPO policy to be *rewarded* for producing a faithful
+# transcript, not just the correct label. This closes the loop of
+# "self-ASR -> use its own transcript -> better label decision".
+#
+# Reward shape (deliberately CONTINUOUS instead of a hard-threshold bonus):
+#     wer = Levenshtein(pred_tokens, gold_tokens) / max(len(gold_tokens), 1)
+#     r   = clip(1.0 - wer, 0.0, 1.0)
+# Rationale for continuous over threshold:
+#   * Threshold ("bonus if wer < T") creates a discontinuity at wer=T --> the
+#     policy oscillates at the boundary; wer=0 and wer=T-eps get the same
+#     reward, so once the model just barely crosses T there is no gradient
+#     pulling it further; below T there is no gradient pulling it up either.
+#   * `1 - wer` is monotone, bounded in [0, 1], differentiable-friendly for
+#     advantage estimation, and directly interpretable.
+#
+# Gating:
+#   * If the completion doesn't contain a <transcript>...</transcript> block,
+#     reward = 0.0  (do NOT return negative; we don't want to over-punish
+#     "went straight to the label" -- the accuracy reward already handles
+#     the label side, WER is strictly a positive-only bonus).
+#   * If `asr_text` (gold transcript) is missing / empty in the jsonl row,
+#     reward = 0.0  (safe fallback for legacy datasets without ASR).
+#
+# Data plumbing:
+#   swift automatically routes extra jsonl columns into reward kwargs, so as
+#   long as the training jsonl (produced by
+#   project/stepaudio/optimize_user_prompt_r1omni_self_asr.py) contains a
+#   top-level `asr_text` field, we receive it as a list[str] here.
+#
+# Env knobs (all optional):
+#   STEPAUDIO_WER_TOKENIZATION  'word' (default) | 'char'  -- unit of edit
+#                                distance. Word-level is more forgiving to
+#                                spelling / punctuation which is irrelevant
+#                                for the downstream emotion task.
+#   STEPAUDIO_WER_LOWERCASE     '1' (default) | '0'  -- lowercase both sides
+#                                before comparison.
+#   STEPAUDIO_WER_STRIP_PUNCT   '1' (default) | '0'  -- strip common
+#                                punctuation before tokenization (word mode).
+#
+# Backwards compat: NEW reward name, additive registration; no existing
+# reward is modified. Enable via run_train_grpo_meld.sh:
+#     REWARD_FUNCS="stepaudio_accuracy_recall stepaudio_transcript_wer"
+#     REWARD_WEIGHTS="1.0 0.3"
+# --------------------------------------------------------------------------- #
+
+# Extract the *first* <transcript>...</transcript> block; tolerant to
+# missing closing tag by falling back to "<transcript> ... <answer>" span.
+_TRANSCRIPT_RE = re.compile(
+    r'<\s*transcript\s*>(.*?)<\s*/\s*transcript\s*>',
+    re.IGNORECASE | re.DOTALL,
+)
+_TRANSCRIPT_OPEN_ONLY_RE = re.compile(
+    r'<\s*transcript\s*>(.*?)(?:<\s*answer\s*>|$)',
+    re.IGNORECASE | re.DOTALL,
+)
+_WER_PUNCT_RE = re.compile(r"[.,!?;:\"'`()\[\]{}<>*_~/\\|@#$%^&+=]+")
+
+
+def _extract_transcript(text: str) -> str:
+    """Pull the text inside <transcript>...</transcript>. Returns '' if not present.
+
+    Falls back to "<transcript>...<answer>" span (no closing tag but the
+    label section still starts) to be resilient against MAX_COMPLETION_LENGTH
+    truncation right after the transcript body.
+    """
+    if not text:
+        return ''
+    m = _TRANSCRIPT_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    m = _TRANSCRIPT_OPEN_ONLY_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return ''
+
+
+def _wer_tokenize(text: str, tokenization: str, lowercase: bool, strip_punct: bool):
+    """Return list of tokens for edit-distance computation."""
+    if text is None:
+        return []
+    s = str(text)
+    if lowercase:
+        s = s.lower()
+    if tokenization == 'char':
+        # keep original chars (still may strip whitespace).
+        if strip_punct:
+            s = _WER_PUNCT_RE.sub('', s)
+        return [c for c in s if not c.isspace()]
+    # word-level (default)
+    if strip_punct:
+        s = _WER_PUNCT_RE.sub(' ', s)
+    return [tok for tok in re.split(r'\s+', s.strip()) if tok]
+
+
+def _levenshtein(a, b) -> int:
+    """Standard O(len(a) * len(b)) Levenshtein on token sequences.
+
+    For MELD-style utterances (~30-60 words) this is ~a few thousand ops per
+    pair, entirely negligible relative to GRPO's per-step generation cost.
+    """
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    # Two-row rolling buffer.
+    prev = list(range(lb + 1))
+    cur = [0] * (lb + 1)
+    for i in range(1, la + 1):
+        cur[0] = i
+        ai = a[i - 1]
+        for j in range(1, lb + 1):
+            cost = 0 if ai == b[j - 1] else 1
+            cur[j] = min(
+                prev[j] + 1,        # deletion
+                cur[j - 1] + 1,     # insertion
+                prev[j - 1] + cost, # substitution
+            )
+        prev, cur = cur, prev
+    return prev[lb]
+
+
+def _wer(pred: str, gold: str, tokenization: str, lowercase: bool, strip_punct: bool) -> float:
+    """Word (or char) error rate: edits / max(1, len(gold_tokens)).
+
+    Returns 1.0 (worst) if gold is empty AND pred is non-empty (all insertion),
+    0.0 if both empty.
+    """
+    p_tok = _wer_tokenize(pred, tokenization, lowercase, strip_punct)
+    g_tok = _wer_tokenize(gold, tokenization, lowercase, strip_punct)
+    if not g_tok:
+        return 0.0 if not p_tok else 1.0
+    d = _levenshtein(p_tok, g_tok)
+    return d / float(len(g_tok))
+
+
+class StepAudioTranscriptWER(ORM):
+    """Continuous WER-based bonus reward for the <transcript>...</transcript> segment.
+
+    reward = clip(1.0 - WER(pred_transcript, gold_asr_text), 0.0, 1.0)
+    reward = 0.0 if either <transcript> tag is missing in completion or
+             `asr_text` / `transcript` field is missing in the training row.
+
+    Env knobs (STEPAUDIO_WER_TOKENIZATION / _LOWERCASE / _STRIP_PUNCT). See
+    module-level docstring above.
+    """
+
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+        except TypeError:
+            super().__init__()
+        self._tokenization = _os.environ.get('STEPAUDIO_WER_TOKENIZATION', 'word').strip().lower()
+        if self._tokenization not in ('word', 'char'):
+            print(f'[WARN] STEPAUDIO_WER_TOKENIZATION={self._tokenization!r} invalid; '
+                  f'falling back to "word".', flush=True)
+            self._tokenization = 'word'
+        self._lowercase = _os.environ.get('STEPAUDIO_WER_LOWERCASE', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
+        self._strip_punct = _os.environ.get('STEPAUDIO_WER_STRIP_PUNCT', '1').strip().lower() not in ('0', 'false', 'no', 'off', '')
+        print(
+            f'[StepAudioTranscriptWER] tokenization={self._tokenization} '
+            f'lowercase={self._lowercase} strip_punct={self._strip_punct}',
+            flush=True,
+        )
+
+    def __call__(
+        self,
+        completions: List[str],
+        asr_text: Optional[List[str]] = None,
+        transcript: Optional[List[str]] = None,
+        solution: Optional[List[str]] = None,
+        label: Optional[List[str]] = None,
+        messages: Optional[List] = None,
+        instruction: Optional[List[str]] = None,
+        **kwargs,
+    ) -> List[float]:
+        # Prefer `asr_text` (native column name from
+        # optimize_user_prompt_r1omni_self_asr.py); fall back to `transcript`
+        # for datasets renamed via --columns; further fall back to `solution`
+        # for math-style pipelines. `label` is ignored here (this reward
+        # doesn't grade the emotion label -- accuracy_recall does).
+        golds = asr_text if asr_text is not None else transcript
+        if golds is None:
+            golds = solution
+        n = len(completions)
+        if golds is None:
+            golds = [''] * n
+
+        rewards: List[float] = []
+        for i in range(n):
+            comp = completions[i] or ''
+            gold = str(golds[i]) if golds[i] is not None else ''
+            pred = _extract_transcript(comp)
+            if not pred:
+                rewards.append(0.0)
+                continue
+            if not gold.strip():
+                rewards.append(0.0)
+                continue
+            wer = _wer(pred, gold, self._tokenization, self._lowercase, self._strip_punct)
+            r = 1.0 - wer
+            if r < 0.0:
+                r = 0.0
+            elif r > 1.0:
+                r = 1.0
+            rewards.append(float(r))
+        return rewards
+
+
+orms['stepaudio_transcript_wer'] = StepAudioTranscriptWER
