@@ -164,6 +164,23 @@ TS=$(date +%Y%m%d_%H%M%S)
 SUMMARY_MD="$RUN_DIR/sweep_eval_summary_${TS}.md"
 echo "[INFO] 汇总 markdown 将写入: $SUMMARY_MD"
 
+# ---- 选择 python 解释器 (循环内的预热步骤也会用到) ----
+# 优先 conda env-3.12.11, 其次 python3
+CONDA_PY="/data/miniconda3/envs/env-3.12.11/bin/python"
+if [ -x "$CONDA_PY" ]; then
+    PYTHON_BIN="$CONDA_PY"
+else
+    PYTHON_BIN=$(command -v python3 || command -v python)
+fi
+
+# ---- HF 动态模块缓存根目录 (trust_remote_code 缓存)
+# 多卡 DDP 首次加载同一个 ckpt 时, transformers 会把 configuration_*.py / modeling_*.py
+# 复制到该目录; 4 个 rank 并发写入没有互斥锁, 曾出现 rank 加载到"半写"文件 → AttributeError:
+# 'module ... has no attribute StepAudio2Config'. 因此每个 ckpt 开跑前:
+#   1) 清理旧缓存目录 (方案 B), 避免残留混合状态;
+#   2) 单进程 AutoConfig 预热 (方案 A), 把缓存冷启动写盘一次, 后续 4 rank 只读不写.
+HF_MODULES_ROOT="${HF_MODULES_CACHE:-$HOME/.cache/huggingface/modules}/transformers_modules"
+
 # ---- 依次跑推理 + 评估 ----
 # 记录每个 ckpt 的 eval_summary.json 路径, 供最后汇总用
 EVAL_JSONS=()
@@ -182,6 +199,45 @@ for CKPT_DIR in "${SELECTED_CKPTS[@]}"; do
     echo "[SWEEP] RESULT     = $RESULT_PATH"
     echo "[SWEEP] EVAL_OUT   = $EVAL_OUTPUT_DIR"
     echo "================================================================"
+
+    # ---- HF dynamic module cache: 清理 + 预热 (仅当本轮真的会推理时才做) ----
+    if [ "$SKIP_INFER" != "1" ]; then
+        # transformers 会把 ckpt 目录名做 slug 化后作为缓存子目录名.
+        # 新版本 (transformers>=5): '-' -> '_hyphen_'   (例: checkpoint-200 -> checkpoint_hyphen_200)
+        # 旧版本:                    '-' -> '_'         (例: checkpoint-200 -> checkpoint_200)
+        # 两种可能命名一并清理, 保证干净的冷启动.
+        _CKPT_BASENAME=$(basename "$CKPT_DIR")                                # e.g. checkpoint-200
+        _CKPT_SLUG_NEW=$(echo "$_CKPT_BASENAME" | sed 's/-/_hyphen_/g')        # checkpoint_hyphen_200
+        _CKPT_SLUG_OLD=$(echo "$_CKPT_BASENAME" | tr '-' '_')                  # checkpoint_200
+        for _slug in "$_CKPT_SLUG_NEW" "$_CKPT_SLUG_OLD"; do
+            _cache_dir="$HF_MODULES_ROOT/$_slug"
+            if [ -d "$_cache_dir" ]; then
+                echo "[SWEEP] 清理旧的 HF 动态模块缓存: $_cache_dir"
+                rm -rf "$_cache_dir"
+            fi
+        done
+
+        # 单进程预热: 触发 transformers 把 configuration_*.py / modeling_*.py 复制到缓存目录,
+        # 由于是单进程串行执行, 不会有并发写导致的"半文件"问题.
+        # 之后 torchrun 4 rank 再进来时会命中缓存 (跳过 copy), 从而避免 race.
+        echo "[SWEEP] 预热 HF 动态模块缓存 (单进程 AutoConfig.from_pretrained)..."
+        env CKPT_DIR_FOR_PREWARM="$CKPT_DIR" "$PYTHON_BIN" - <<'PY'
+import os, sys, traceback
+ckpt = os.environ["CKPT_DIR_FOR_PREWARM"]
+try:
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(ckpt, trust_remote_code=True)
+    print(f"[PREWARM] OK: {type(cfg).__name__} loaded from {ckpt}")
+except Exception as e:
+    print(f"[PREWARM] FAILED: {e!r}", file=sys.stderr)
+    traceback.print_exc()
+    sys.exit(1)
+PY
+        if [ $? -ne 0 ]; then
+            echo "[ERROR] 预热 HF 动态模块缓存失败, 中止评测。" >&2
+            exit 1
+        fi
+    fi
 
     # ---- 推理阶段 ----
     if [ "$SKIP_INFER" != "1" ]; then
@@ -247,13 +303,7 @@ for CKPT_DIR in "${SELECTED_CKPTS[@]}"; do
 done
 
 # ---- 汇总 markdown ----
-# 选择 python 解释器: 优先 conda env-3.12.11, 其次 python3
-CONDA_PY="/data/miniconda3/envs/env-3.12.11/bin/python"
-if [ -x "$CONDA_PY" ]; then
-    PYTHON_BIN="$CONDA_PY"
-else
-    PYTHON_BIN=$(command -v python3 || command -v python)
-fi
+# PYTHON_BIN 已在循环开始前定义, 此处直接复用即可.
 
 echo ""
 echo "================================================================"
