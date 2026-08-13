@@ -33,6 +33,11 @@ from transformers.trainer import OPTIMIZER_NAME, PREFIX_CHECKPOINT_DIR, SCHEDULE
 from transformers.trainer import Trainer as HfTrainer
 from transformers.trainer import reissue_pt_warnings
 from transformers.trainer_utils import IntervalStrategy
+
+try:
+    from transformers.trainer_utils import sort_checkpoints
+except ImportError:
+    sort_checkpoints = None
 from types import MethodType
 from typing import Callable, Dict, List, Optional
 
@@ -278,6 +283,12 @@ class SwiftMixin:
         if self.args.resume_only_model:
             return
         super()._load_optimizer_and_scheduler(*args, **kwargs)
+        callbacks = set(getattr(self.args, 'callbacks', []))
+        ds_config = getattr(self.args, 'deepspeed', None) or {}
+        checkpoint_config = ds_config.get('checkpoint') if isinstance(ds_config, dict) else None
+        load_universal = isinstance(checkpoint_config, dict) and checkpoint_config.get('load_universal', False)
+        if 'deepspeed_elastic' in callbacks and load_universal:
+            self._fix_optimizer_step_device(self.optimizer)
         if is_mp_ddp():
             # fix mp+ddp adamw
             for v in self.optimizer.state.values():
@@ -287,7 +298,32 @@ class SwiftMixin:
                     if len(device_set) >= 1:
                         v['step'] = v['step'].to('cpu')
 
+    @staticmethod
+    def _fix_optimizer_step_device(optimizer):
+        state = getattr(optimizer, 'state', None)
+        if not isinstance(state, dict):
+            return
+        for value in state.values():
+            if not isinstance(value, dict):
+                continue
+            step = value.get('step')
+            if not isinstance(step, torch.Tensor):
+                continue
+            target_device = None
+            for state_key, state_value in value.items():
+                if state_key == 'step':
+                    continue
+                if isinstance(state_value, torch.Tensor) and state_value.device.type != 'cpu':
+                    target_device = state_value.device
+                    break
+            if target_device is not None and step.device != target_device:
+                value['step'] = step.to(target_device)
+
     def _save_model(self, output_dir: Optional[str] = None, state_dict=None):
+        # If template defines a save_callback, delegate to it
+        if hasattr(self, 'template') and hasattr(self.template, 'save_callback'):
+            self.template.save_callback(self.model, output_dir)
+            return
         # model
         supported_classes = (SwiftModel, PreTrainedModel, PeftModel)
         supported_names = ('SentenceTransformer', )
@@ -415,7 +451,24 @@ class SwiftMixin:
         last_step = self._get_last_checkpoint_step()
 
         # Check if we should delete older checkpoint(s)
-        checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+        if hasattr(self, '_sorted_checkpoints'):
+            checkpoints_sorted = self._sorted_checkpoints(use_mtime=use_mtime, output_dir=output_dir)
+        else:
+            output_dir = output_dir if output_dir is not None else self.args.output_dir
+            if sort_checkpoints is not None:
+                checkpoints_sorted = sort_checkpoints(
+                    output_dir=output_dir,
+                    checkpoint_prefix=PREFIX_CHECKPOINT_DIR,
+                    use_mtime=use_mtime,
+                    best_model_checkpoint=self.state.best_model_checkpoint,
+                )
+            else:
+                checkpoints = []
+                for path in os.listdir(output_dir) if os.path.isdir(output_dir) else []:
+                    if re.match(f'^{PREFIX_CHECKPOINT_DIR}-([0-9]+)$', path):
+                        checkpoints.append(os.path.join(output_dir, path))
+                ordering = os.path.getmtime if use_mtime else lambda path: int(path.rsplit('-', 1)[-1])
+                checkpoints_sorted = sorted(checkpoints, key=ordering)
 
         valid_checkpoints = []
         for path in checkpoints_sorted:
@@ -659,12 +712,32 @@ class SwiftMixin:
     @contextmanager
     def _fix_grad_norm_nan():
         from accelerate import Accelerator
+        from accelerate.utils import DistributedType
         origin_clip_grad_norm_ = Accelerator.clip_grad_norm_
 
         def clip_grad_norm_(self, parameters, *args, **kwargs):
             # If NaN occurs, ignore weight updates.
             parameters = list(parameters)
-            grad_norm = origin_clip_grad_norm_(self, parameters, *args, **kwargs)
+            cpu_offloaded_fsdp2 = (
+                self.distributed_type == DistributedType.FSDP and self.is_fsdp2
+                and any(p.grad is not None and p.grad.is_cpu for p in parameters))
+            if cpu_offloaded_fsdp2:
+                self.unscale_gradients()
+                max_norm = args[0] if args else kwargs['max_norm']
+                norm_type = args[1] if len(args) > 1 else kwargs.get('norm_type', 2)
+                norm_type = float(norm_type)
+                grads = [p.grad for p in parameters if p.grad is not None]
+                foreach_norm = getattr(torch, '_foreach_norm', None)
+                if foreach_norm is None:
+                    grad_norms = [torch.linalg.vector_norm(grad, ord=norm_type) for grad in grads]
+                else:
+                    grad_norms = foreach_norm(grads, norm_type)
+                grad_norm = torch.nn.utils.get_total_norm([norm.to(self.device) for norm in grad_norms], norm_type)
+                if hasattr(grad_norm, 'full_tensor'):
+                    grad_norm = grad_norm.full_tensor()
+                torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, grad_norm)
+            else:
+                grad_norm = origin_clip_grad_norm_(self, parameters, *args, **kwargs)
             if isinstance(grad_norm, torch.Tensor) and grad_norm.isnan().item():
                 for p in parameters:
                     p.grad = None

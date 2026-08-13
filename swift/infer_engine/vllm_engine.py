@@ -88,6 +88,36 @@ def _patch_vllm_dp_coordinator_timeout():
 _patch_vllm_dp_coordinator_timeout()
 
 
+@contextmanager
+def _patch_rope_validation_ignore_keys():
+    """Accept list-style RoPE validation ignore keys from older vLLM configs.
+
+    vLLM 0.18.x Qwen3.5 configs may pass ``ignore_keys_at_rope_validation``
+    as a list, while Transformers 5.x treats it as a set and performs a set
+    union during RoPE validation. vLLM release tags from 0.19.0 onward changed
+    the Qwen3.5 configs to set literals, but 0.18-based vLLM/vLLM-Ascend stacks
+    still need this compatibility layer. See vLLM PR:
+    https://github.com/vllm-project/vllm/pull/37338
+    """
+    from transformers import PretrainedConfig
+
+    origin_convert = getattr(PretrainedConfig, 'convert_rope_params_to_dict', None)
+    if origin_convert is None:
+        yield
+        return
+
+    def convert_rope_params_to_dict(self, ignore_keys_at_rope_validation=None, **kwargs):
+        if isinstance(ignore_keys_at_rope_validation, list):
+            ignore_keys_at_rope_validation = set(ignore_keys_at_rope_validation)
+        return origin_convert(self, ignore_keys_at_rope_validation=ignore_keys_at_rope_validation, **kwargs)
+
+    PretrainedConfig.convert_rope_params_to_dict = convert_rope_params_to_dict
+    try:
+        yield
+    finally:
+        PretrainedConfig.convert_rope_params_to_dict = origin_convert
+
+
 class VllmEngine(InferEngine):
 
     def __init__(
@@ -224,7 +254,7 @@ class VllmEngine(InferEngine):
 
     def _prepare_engine(self) -> None:
         with patch_auto_tokenizer(self.tokenizer), self._patch_auto_config(), \
-                disable_deepspeed_zero3():
+                _patch_rope_validation_ignore_keys(), disable_deepspeed_zero3():
             llm_engine_cls = AsyncLLMEngine if self.use_async_engine else LLMEngine
             engine = llm_engine_cls.from_engine_args(self.engine_args)
         self.engine = engine
@@ -236,13 +266,14 @@ class VllmEngine(InferEngine):
         def _from_pretrained(*args, **kwargs):
             config = deepcopy(self.config)
             if self._version_ge('0.19'):
+                if self.model_type == 'deepseek_v4':
+                    return _old_from_pretrained(*args, **kwargs)
                 if self._config_cls is None:
+                    kwargs = {**kwargs, 'trust_remote_code': self.model_meta.loader.default_trust_remote_code}
                     hf_config = _old_from_pretrained(*args, **kwargs)
                     self._config_cls = hf_config.__class__
                 if not isinstance(config, self._config_cls):
                     config.__class__ = self._config_cls
-                    if self.model_type == 'deepseek_v4':
-                        config.rope_parameters.setdefault('rope_type', 'default')
             return config
 
         AutoConfig.from_pretrained = _from_pretrained
@@ -254,18 +285,28 @@ class VllmEngine(InferEngine):
     def _prepare_engine_kwargs(self, max_model_len, engine_kwargs) -> None:
         if engine_kwargs is None:
             engine_kwargs = {}
-        if self.task_type == 'embedding':
-            self.task = 'embed'
-        elif self.task_type == 'seq_cls':
-            self.task = 'classify'
-        elif self.task_type in ('reranker', 'generative_reranker'):
-            self.task = 'score'
+        encode_task_mapping = {
+            'embedding': 'embed',
+            'seq_cls': 'classify',
+            'reranker': 'score',
+            'generative_reranker': 'score',
+        }
+        vllm_task = encode_task_mapping.get(self.task_type)
         disable_log_stats = engine_kwargs.pop('disable_log_stats', True)
         if self.use_async_engine:
             engine_cls = AsyncEngineArgs
         else:
             engine_cls = EngineArgs
         parameters = inspect.signature(engine_cls).parameters
+        if vllm_task:
+            if 'runner' in parameters:
+                engine_kwargs['runner'] = 'pooling'
+            elif 'task' in parameters:
+                engine_kwargs['task'] = vllm_task
+            else:
+                raise ValueError(
+                    f'task_type={self.task_type} requires a vLLM version that supports `runner` or `task`. '
+                    'Please upgrade vLLM.')
         if self.use_async_engine and 'disable_log_requests' in parameters:
             engine_kwargs['disable_log_requests'] = True
         if 'enable_lora' in parameters and self.enable_lora:
@@ -291,10 +332,8 @@ class VllmEngine(InferEngine):
                     engine_kwargs[key] = value
             else:
                 logger.warning(f'The current version of vLLM does not support `{key}`. Ignored.')
-        for key in ['task', 'seed']:
-            val = getattr(self, key, None)
-            if val is not None:
-                engine_kwargs[key] = val
+        if self.seed is not None:
+            engine_kwargs['seed'] = self.seed
 
         model_info = self.model_info
         arch_mapping = {'deepseek_vl2': ['DeepseekVLV2ForCausalLM'], 'chatglm4v': ['GLM4VForCausalLM']}
@@ -477,7 +516,7 @@ class VllmEngine(InferEngine):
 
     def _prepare_generation_config(self, request_config: RequestConfig) -> SamplingParams:
         kwargs = {'max_tokens': request_config.max_tokens}
-        for key in ['temperature', 'top_k', 'top_p', 'repetition_penalty']:
+        for key in ['temperature', 'top_k', 'top_p', 'min_p', 'repetition_penalty']:
             new_value = getattr(request_config, key)
             if new_value is None:
                 kwargs[key] = getattr(self.generation_config, key)

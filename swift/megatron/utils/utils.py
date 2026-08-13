@@ -217,6 +217,11 @@ def get_padding_to(args):
     fp4_format = getattr(args, 'fp4_format', None) or getattr(args, 'fp4', None)
     if args.fp8_recipe == 'blockwise':
         padding_to = (padding_to or 1) * 128
+    elif args.fp8_recipe == 'mxfp8':
+        # MXFP8 uses a block size of 32. Under sequence parallel, the sequence is
+        # split across TP ranks, so each per-rank shard (seq_len / TP) must itself
+        # be divisible by 32. Pad the total length to TP * 32 to guarantee this.
+        padding_to = (padding_to or 1) * 32
     elif fp8_format is not None or fp4_format is not None:
         padding_to = (padding_to or 1) * 16
     if args.attention_backend == 'fused':
@@ -224,14 +229,29 @@ def get_padding_to(args):
     return padding_to
 
 
-def get_packed_seq_params(position_ids: torch.Tensor) -> PackedSeqParams:
+def get_packed_seq_params(args, position_ids: torch.Tensor) -> PackedSeqParams:
     params = _get_packed_seq_params(position_ids)
+    # max_seqlen must be a Python int rather than a 0-dim CUDA tensor.
+    # flash-attn 4 (CuTe DSL) embeds booleans derived from max_seqlen into its
+    # backward-kernel compile-cache key; a tensor there hashes by object identity,
+    # so the cache never hits and every micro-batch backward triggers a full JIT
+    # recompilation (~30s each), slowing training by >10x.
+    max_seqlen_q = params['max_length_q']
+    max_seqlen_kv = params['max_length_k']
+    if isinstance(max_seqlen_q, torch.Tensor):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if isinstance(max_seqlen_kv, torch.Tensor):
+        max_seqlen_kv = int(max_seqlen_kv.item())
     packed = PackedSeqParams(
         cu_seqlens_q=params['cu_seq_lens_q'],
         cu_seqlens_kv=params['cu_seq_lens_k'],
-        max_seqlen_q=params['max_length_q'],
-        max_seqlen_kv=params['max_length_k'],
-        qkv_format='thd')
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        qkv_format='thd',
+        total_tokens=position_ids.numel(),
+    )
+    if hasattr(packed, 'cp_partition_mode'):
+        packed.cp_partition_mode = args.cp_partition_mode
 
     if is_torch_npu_available():
         packed.cu_seqlens_q_padded = params['cu_seq_lens_q']

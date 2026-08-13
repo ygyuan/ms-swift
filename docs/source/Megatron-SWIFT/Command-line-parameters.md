@@ -38,6 +38,7 @@
 - 🔥optimizer_cpu_offload: 将优化器状态卸载到 CPU，例如设置：`--use_precision_aware_optimizer true --optimizer_cpu_offload true --optimizer_offload_fraction 0.7`。默认为False。
   - 该参数可以显著降低显存占用（但增加内存占用）。若global_batch_size较大，则对训练速度的影响不大。
 - 🔥optimizer_offload_fraction: 卸载到 CPU 的优化器状态所占比例。默认为1.。
+- optimizer_cuda_graph: 是否为优化器步骤启用 CUDA 计算图，传递给 Megatron 的 `--optimizer-cuda-graph`。默认为False。该参数需要"megatron-core>=0.17"。
 - use_precision_aware_optimizer: 使用 TransformerEngine 中的精度感知优化器，该优化器允许将主参数和优化器状态设置为较低精度，例如 fp16 和 fp8。
 - main_grads_dtype: 启用 use_precision_aware_optimizer 时主梯度的 dtype。可选为'fp32', 'bf16'。默认为'fp32'。
 - main_params_dtype: 启用 use_precision_aware_optimizer 时主参数的 dtype。可选为'fp32', 'fp16'。默认为'fp32'。
@@ -103,6 +104,7 @@
 - muon_num_ns_steps: Muon 优化器的 Newton-Schulz 步数。默认为5。
 - muon_tp_mode: 张量模型并行权重的 NS 计算方式。可选为'blockwise', 'duplicated', 'distributed'。默认为'blockwise'。
 - muon_extra_scale_factor: Muon 更新的额外缩放因子，默认为1。
+- muon_scalar_optimizer: 使用 Muon 时非线性参数（embeddings、biases、norms）的优化器，可选为'adam'或'lion'。默认为'adam'。
 
 
 **checkpoint参数**:
@@ -140,6 +142,9 @@
 - ddp_backend: 分布式后端，可选为'nccl', 'gloo'。默认为nccl。
 - ddp_timeout: 默认为18000000，单位为秒。
 - 🔥use_distributed_optimizer: 使用分布式优化器（即zero1）。默认为True。
+- use_megatron_fsdp: 使用 Megatron-FSDP 作为数据并行的实现（替代DDP）。默认为False。开启后会强制`use_distributed_optimizer=True`，仅支持`sgd`/`adam`优化器，且要求`CUDA_DEVICE_MAX_CONNECTIONS`大于1。
+  - 注意：尽量不要将 Megatron-FSDP 与张量并行（tensor parallelism）或上下文并行（context parallelism）同时使用，因为两者对`CUDA_DEVICE_MAX_CONNECTIONS`的最佳设置相互冲突：序列并行（sequence parallelism）需要将`CUDA_DEVICE_MAX_CONNECTIONS`设为1，而 Megatron-FSDP 则要求不能设为1（以获得更好的并行度）。
+- data_parallel_sharding_strategy: Megatron-FSDP 的数据并行切分策略。可选为'no_shard', 'optim', 'optim_grads', 'optim_grads_params'，默认为'optim_grads_params'。仅在`use_megatron_fsdp=True`时生效。
 - 🔥tensor_model_parallel_size: tp数，默认为1。
 - 🔥pipeline_model_parallel_size: pp数，默认为1。
 - 🔥decoder_first_pipeline_num_layers: decoder第一个流水线阶段所包含的Transformer层数。默认为 None，表示将Transformer层数平均分配到所有流水线阶段。
@@ -151,6 +156,9 @@
 - align_param_gather: 设置为True，所有 PP 阶段将同时启动参数全收集（all-gather）操作。否则，每个 PP 阶段将根据需要独立启动。默认为True。
 - 🔥sequence_parallel: 启动序列并行优化，该参数需要设置`tensor_model_parallel_size`才生效。默认为False。
 - 🔥context_parallel_size: cp数，默认为1。
+- cp_comm_type: 上下文并行（Context Parallelism）中 GPU 间的通信类型。可选值为 "p2p"、"all_gather"、"a2a" 或 "a2a+p2p"。默认为None。
+- cp_partition_mode: THD 序列行如何在上下文并行（context-parallel）ranks 之间进行划分。可选为"zigzag", "contiguous"，默认为"zigzag"。
+- sequence_packing_scheduler: 用于序列打包和动态上下文并行的调度器。可选为"dp_balanced"，"default_dynamic_cp"。dp_balanced：用于序列打包的 DP 均衡调度器。default_dynamic_cp：用于打包序列均衡的动态 CP 调度器。默认为None。
 - tp_comm_overlap: 启用张量并行通信与GEMM（通用矩阵乘法）内核的重叠（降低通信耗时）。默认为False。
 - 🔥overlap_grad_reduce: 启用DDP中grad reduce操作的重叠（降低DP通信耗时）。默认为False。
 - 🔥overlap_param_gather: 启用分布式优化器中参数all-gather的重叠（降低DP通信耗时）。默认为False。
@@ -198,13 +206,13 @@
 - accumulate_allreduce_grads_in_fp32: 在 fp32 精度下进行梯度累积和全规约操作。如果开启`--bf16`且`main_params_dtype`为'fp32'，则设置为True。否则默认设置为False。
 
 **MoE参数**:
-- moe_router_load_balancing_type: 确定路由器的负载均衡策略。可选项为"aux_loss"、"seq_aux_loss"、"global_aux_loss"、"sinkhorn"、"none"。默认值为 None。从config.json中读取。
+- moe_router_load_balancing_type: 确定路由器的负载均衡策略。可选项为"aux_loss"、"seq_aux_loss"、"global_aux_loss"、"sinkhorn"、"none"。支持单/多种策略的列表（如 `--moe_router_load_balancing_type seq_aux_loss global_aux_loss`）。默认值为 None。从config.json中读取。
 - 🔥moe_router_dtype: 用于路由计算和专家输出加权平均的数据类型。可选为'none', 'fp32'、'fp64'，这增强了数值稳定性，尤其是在专家数量较多时。与`moe_permute_fusion`一起使用时，性能影响可以忽略不计。默认为'fp32'。'none'代表不改变数据类型。
 - moe_token_dispatcher_type: 要使用的token分发器类型。可选选项包括 'allgather'、'alltoall'、'flex'和'alltoall_seq'。默认值为'alltoall'。
 - moe_enable_deepep: 启用 DeepEP 以实现 MoE 模型中的高效 token 调度和合并。仅在通过设置 `--moe_token_dispatcher_type flex` 使用弹性 token 调度器时有效。
 - 🔥moe_grouped_gemm: 当每个rank包含多个专家时，通过在多个流中启动多个本地 GEMM 内核，利用 TransformerEngine中的GroupedLinear提高利用率和性能。默认为True。
 - 🔥moe_permute_fusion: 在令牌分发过程中融合令牌重排操作。默认为False。
-- 🔥moe_aux_loss_coeff: 默认为0，不使用aux_loss。通常情况下，该值设置的越大，训练效果越差，但MoE负载越均衡，请根据实验效果，选择合适的值。
+- 🔥moe_aux_loss_coeff: 默认为0，不使用aux_loss。支持单/多个浮点数的列表 ，对应`moe_router_load_balancing_type` 中各策略。通常情况下，该值设置的越大，训练效果越差，但MoE负载越均衡，请根据实验效果，选择合适的值。
 - moe_z_loss_coeff: z-loss 的缩放系数。默认为None。
 - 🔥moe_shared_expert_overlap: 启用共享专家计算与调度器通信之间的重叠。如果不启用此选项，共享专家将在路由专家之后执行。仅在设置了`moe_shared_expert_intermediate_size`时有效。默认为False。
 - 🔥moe_expert_capacity_factor: 每个专家的容量因子，None表示不会丢弃任何token。默认为None。通过设置 `--moe_expert_capacity_factor`，超出专家容量的 token 会基于其被选中的概率被丢弃。可以**令训练负载均匀，提升训练速度**（例如设置为1或2）。
@@ -214,6 +222,7 @@
 **DSA参数**
 - dsa_indexer_loss_coeff: DSA 索引器 KL 散度损失的系数。设置为 0 可禁用索引器损失。默认为`0.`。
 - dsa_indexer_use_sparse_loss: 是否使用稀疏 DSA 索引器损失。如果为 True，索引器损失将使用 top-k 索引进行计算。默认为False。
+- apply_dsa_kernel_fusion: 是否启用融合 DSA 稀疏注意力内核（FlashMLA + cuDNN DSA）。设为 False 将回退到未融合的 PyTorch 实现。需要安装 flash_mla 和 nvidia-cudnn-frontend >= 1.24.0。默认为False。（需使用Megatron-LM dev分支）
 
 **Deepseek-V4**
 - csa_dense_mode: 是否对压缩稀疏注意力使用密集模式。若为 `True`，CSA 索引器将被禁用。默认为False。
@@ -395,23 +404,31 @@ Megatron训练参数继承自Megatron参数和基本参数（**与ms-swift共用
 - log_rollout_offpolicy_metrics: 当 `rollout_importance_sampling_mode` 未设置时，是否记录训推不一致诊断指标（KL、PPL、χ²等）。当设置了 `rollout_importance_sampling_mode` 时，指标会自动记录。默认为False。
 - off_policy_sequence_mask_delta: Off-Policy Sequence Masking 阈值，来自 DeepSeek-V3.2 论文。当设置此值时，会计算每个序列的 `mean(old_policy_logps - policy_logps)`，若该值大于阈值且该序列的优势为负，则 mask 掉该序列不参与损失计算。默认为None，不启用。具体参考[文档](../Instruction/GRPO/AdvancedResearch/training_inference_mismatch.md#off-policy-sequence-masking)。
 - router_replay_mode: 路由重放模式，可选项为`disabled`、`R2`、`R3`。默认为disabled，不启用路由重放。
+- teacher_kl_coef: OPD-RL中teacher_kl的系数，即 `adv_t = base_adv + teacher_kl_coef * teacher_kl`。默认为 1.0。
 
 内置奖励函数参数参考[文档](../Instruction/Command-line-parameters.md#奖励函数参数)
 
 ### GKD参数
-- teacher_model: 教师模型的路径或模型 ID，必需参数。
-- teacher_model_type: 教师模型类型，默认为None，自动检测。
-- teacher_model_revision: 教师模型版本，默认为None。
+
 - beta: JSD 散度插值系数。0.0 代表 Forward KL，0.5 代表对称 JSD，1.0 代表 Reverse KL。默认为0.5。
 - lmbda: On-Policy 学习触发概率。0.0 代表纯 Off-Policy，1.0 代表纯 On-Policy。默认为0.5。
-- seq_kd: 是否使用教师生成的响应（Sequential KD），当前暂不支持。默认为False。
 - temperature: 用于采样和损失计算的温度参数。默认为0.9。
-- offload_teacher_model: 是否将教师模型卸载到 CPU 以节省 GPU 显存。默认为False。
 - sft_alpha: SFT 损失的混合系数，`loss = jsd_loss + sft_alpha * sft_loss`。当使用数据集响应（Off-Policy）时生效。默认为0。
 - max_completion_length: 生成时的最大 token 数。默认为512。
 - vllm_mode: 同 GRPO 参数，用于 On-Policy 生成。colocate 模式下在程序内部署 vLLM。
   - 注意：On-Policy 生成需要启用 vLLM（`--use_vllm true --vllm_mode colocate/server`）。
   - 当 `lmbda > 0` 但未启用 vLLM 时，将自动回退到 Off-Policy 模式。
+
+### teacher 参数
+在GKD与GRPO中使用
+
+- teacher_model: 教师模型的路径或模型 ID，必需参数。
+- teacher_model_type: 教师模型类型，默认为None，自动检测。
+- teacher_model_revision: 教师模型版本，默认为None。
+- teacher_model_server: 教师模型服务地址，通过 `swift deploy` 部署后用于获取 logprobs，与 `teacher_model` 互斥。支持单 URL 或多 teacher JSON（`'[{"url":"...","tags":["..."]}, ...]'`）。详见[蒸馏文档](../Instruction/Distillation.md#multi-teacher多教师路由)。
+- teacher_tag_key: 多 teacher 路由时样本匹配 teacher `tags` 的字段名，默认为 `"dataset"`。
+- offload_teacher_model: 是否将教师模型卸载到 CPU 以节省 GPU 显存。默认为False。
+
 
 ## 导出参数
 这里介绍`megatron export`的参数，若要使用`swift export`导出命令，请参考[ms-swift命令行参数文档](../Instruction/Command-line-parameters.md#导出参数)。`megatron export`相比`swift export`，支持分布式和多机导出。Megatron导出参数继承自Megatron参数和基本参数。

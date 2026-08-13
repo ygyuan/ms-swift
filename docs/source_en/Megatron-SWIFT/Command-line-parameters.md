@@ -40,6 +40,7 @@
 - 🔥optimizer_cpu_offload: Offloads optimizer states to the CPU. For example, set: `--use_precision_aware_optimizer true --optimizer_cpu_offload true --optimizer_offload_fraction 0.7`. Defaults to `False`.
   - This parameter can significantly reduce GPU memory usage (at the cost of increased CPU memory consumption). When the `global_batch_size` is large, its impact on training speed is minimal.
 - 🔥optimizer_offload_fraction: The fraction of the optimizer state to offload to CPU. Default is `1.0`.
+- optimizer_cuda_graph: Whether to enable CUDA graph for the optimizer step, forwarded to Megatron's `--optimizer-cuda-graph`. Default is `False`. This parameter requires "megatron-core>=0.17".
 - use_precision_aware_optimizer: Use the precision-aware optimizer in TransformerEngine, which allows setting the main parameters and optimizer states to lower precision, such as fp16 and fp8.
 - main_grads_dtype: The dtype of main gradients when use_precision_aware_optimizer is enabled. Options are 'fp32' and 'bf16'. Default is 'fp32'.
 - main_params_dtype: The dtype of main parameters when use_precision_aware_optimizer is enabled. Options are 'fp32' and 'fp16'. Default is 'fp32'.
@@ -109,6 +110,7 @@
 - muon_num_ns_steps: Number of Newton-Schulz steps for the Muon optimizer. Default is 5.
 - muon_tp_mode: NS calculation method for tensor model parallel weights. Options include 'blockwise', 'duplicated', and 'distributed'. Default is 'blockwise'.
 - muon_extra_scale_factor: Additional scale factor for Muon updates. Default is 1.
+- muon_scalar_optimizer: Optimizer for nonlinear parameters (embeddings, biases, norms) when using Muon. Options are 'adam' or 'lion'. Default is 'adam'.
 
 **Checkpoint Parameters**:
 
@@ -146,6 +148,9 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 - ddp_backend: Distributed backend. Options are 'nccl' or 'gloo'. Defaults to nccl.
 - ddp_timeout: Defaults to 18000000, in seconds.
 - 🔥use_distributed_optimizer: Use a distributed optimizer (i.e., ZeRO-1). Default is True.
+- use_megatron_fsdp: Use Megatron-FSDP as the data-parallel implementation (in place of DDP). Default is False. When enabled, it forces `use_distributed_optimizer=True`, only supports the `sgd`/`adam` optimizers, and requires `CUDA_DEVICE_MAX_CONNECTIONS` greater than 1.
+  - Note: Try not to use Megatron-FSDP together with tensor parallelism or context parallelism, since they require conflicting `CUDA_DEVICE_MAX_CONNECTIONS` settings for best performance: sequence parallelism requires setting `CUDA_DEVICE_MAX_CONNECTIONS` to 1, while Megatron-FSDP requires not setting it to 1 (for better parallelization).
+- data_parallel_sharding_strategy: The data-parallel sharding strategy for Megatron-FSDP. Options are 'no_shard', 'optim', 'optim_grads', 'optim_grads_params'; default is 'optim_grads_params'. Only takes effect when `use_megatron_fsdp=True`.
 - 🔥tensor_model_parallel_size: TP (Tensor Parallelism) size, default is 1.
 - 🔥pipeline_model_parallel_size: PP (Pipeline Parallelism) size, default is 1.
 - 🔥decoder_first_pipeline_num_layers: The number of Transformer layers in the first pipeline stage of the decoder. Default is None, which means the Transformer layers are evenly distributed across all pipeline stages.
@@ -157,6 +162,9 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 - align_param_gather: When set to True, all PP stages will launch parameter all-gather operations simultaneously. Otherwise, each PP stage will launch independently as needed. Defaults to True.
 - 🔥sequence_parallel: Enables sequence parallel optimization; this option takes effect only when `tensor_model_parallel_size` is set. Default is False.
 - 🔥context_parallel_size: CP (Context Parallelism) size, default is 1.
+- cp_comm_type: The inter-GPU communication type for context parallelism. Accepted values are `"p2p"`, `"all_gather"`, `"a2a"`, or `"a2a+p2p"`. Defaults to `None`.
+- cp_partition_mode: How THD sequence rows are partitioned across context-parallel ranks.
+- sequence_packing_scheduler: Scheduler for sequence packing and dynamic context parallel. Optional values are "dp_balanced" and "default_dynamic_cp". dp_balanced: DP-balanced scheduler for sequence packing. default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing. Defaults to None.
 - tp_comm_overlap: Overlap tensor parallel communication with GEMM (General Matrix Multiplication) kernels (to reduce communication time). Default is False.
 - 🔥overlap_grad_reduce: Overlap grad reduction operations in DDP (to reduce DP communication time). Default is False.
 - 🔥overlap_param_gather: Overlap all-gather of parameters in the distributed optimizer (to reduce DP communication time). Default is False.
@@ -208,13 +216,13 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 - accumulate_allreduce_grads_in_fp32: Perform gradient accumulation and allreduce operations in fp32 precision. If `--bf16` is enabled and `main_params_dtype` is 'fp32', this is set to True. Otherwise, it defaults to False.
 
 **MoE Parameters**:
-- moe_router_load_balancing_type: Determines the load balancing strategy for the router. Options include "aux_loss", "seq_aux_loss", "global_aux_loss", "sinkhorn", and "none". Default value is None. Read from config.json.
+- moe_router_load_balancing_type: Determines the load balancing strategy for the router. Options include "aux_loss", "seq_aux_loss", "global_aux_loss", "sinkhorn", and "none". Supports a single strategy or a list of multiple strategies (e.g. `--moe_router_load_balancing_type seq_aux_loss global_aux_loss`). Default value is None. Read from config.json.
 - 🔥moe_router_dtype: Data type used for routing computation and expert output weighted averaging. Options are 'none', 'fp32', and 'fp64', which enhances numerical stability, especially when the number of experts is large. When used together with `moe_permute_fusion`, the performance impact is negligible. Default is 'fp32'. 'none' means no change to data type.
 - moe_token_dispatcher_type: The type of token dispatcher to use. Options include 'allgather', 'alltoall', 'flex', and 'alltoall_seq'. Default is 'alltoall'.
 - moe_enable_deepep: Enable DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting `--moe_token_dispatcher_type flex`.
 - 🔥moe_grouped_gemm: When each rank contains multiple experts, multiple local GEMM kernels can be launched in parallel streams to improve utilization and performance by using GroupedLinear from TransformerEngine. Default is True.
 - 🔥moe_permute_fusion: Fuses token permutation operations during token dispatch. Default is False.
-- 🔥moe_aux_loss_coeff: Defaults to 0, meaning the auxiliary loss is not used. Generally, a higher value leads to worse training performance but more balanced MoE expert utilization. Please choose an appropriate value based on experimental results.
+- 🔥moe_aux_loss_coeff: Defaults to 0, meaning the auxiliary loss is not used. Supports a single float or a list of floats corresponding to each strategy in `moe_router_load_balancing_type`. Generally, a higher value leads to worse training performance but more balanced MoE expert utilization. Please choose an appropriate value based on experimental results.
 - moe_z_loss_coeff: Scaling coefficient for z-loss. Default is None.
 - 🔥moe_shared_expert_overlap: Enables overlap between shared expert computation and the dispatcher. If not enabled, shared expert computation will be performed after routing experts. Only effective when `moe_shared_expert_intermediate_size` is set. Default is False.
 - 🔥moe_expert_capacity_factor: Capacity factor for each expert. `None` means no tokens will be dropped. Default is `None`. When `--moe_expert_capacity_factor` is set, tokens exceeding an expert’s capacity will be dropped based on their selection probability. This can **balance the training load and improve training speed** (for example, set it to 1. or 2.).
@@ -225,6 +233,7 @@ For guidance on selecting parallelization strategies, please refer to the [Train
 
 - dsa_indexer_loss_coeff: Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss. Default is `0.`.
 - dsa_indexer_use_sparse_loss: Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the top-k indices. Default is False.
+- apply_dsa_kernel_fusion: Whether to enable fused DSA sparse-attention kernels (FlashMLA + cuDNN DSA). Set to False to fall back to unfused PyTorch implementations. Requires flash_mla and nvidia-cudnn-frontend >= 1.24.0. Default is False. (Requires the Megatron-LM dev branch)
 
 **Deepseek-V4**
 
@@ -418,24 +427,31 @@ In addition to inheriting the training parameters, the following parameters are 
 - log_rollout_offpolicy_metrics: Whether to log training-inference mismatch diagnostic metrics (KL, PPL, χ², etc.) when `rollout_importance_sampling_mode` is not set. When `rollout_importance_sampling_mode` is set, metrics are always logged. Default is False.
 - off_policy_sequence_mask_delta: Off-Policy Sequence Masking threshold from [DeepSeek-V3.2 paper](https://arxiv.org/abs/2512.02556). When set, computes `mean(old_policy_logps - policy_logps)` for each sequence. If this value exceeds the threshold AND the sequence has negative advantage, the sequence is masked out from loss computation. For details, refer to the [documentation](../Instruction/GRPO/AdvancedResearch/training_inference_mismatch.md#off-policy-sequence-masking).
 - router_replay_mode: Router replay mode. Options are `disabled`,`R2`,`R3`. Default is disabled.
+- teacher_kl_coef: Coefficient for teacher KL in OPD-RL, i.e. `adv_t = base_adv + teacher_kl_coef * teacher_kl`. Default is 1.0.
 
 Built-in reward function parameters refer to the [documentation](../Instruction/Command-line-parameters.md#reward-function-parameters).
 
 ### GKD Parameters
 
-- teacher_model: Path or model ID of the teacher model. Required.
-- teacher_model_type: Teacher model type. Default is None, auto-detected.
-- teacher_model_revision: Teacher model version. Default is None.
 - beta: JSD divergence interpolation coefficient. 0.0 means Forward KL, 0.5 means symmetric JSD, 1.0 means Reverse KL. Default is 0.5.
 - lmbda: On-Policy learning probability. 0.0 means pure Off-Policy, 1.0 means pure On-Policy. Default is 0.5.
-- seq_kd: Whether to use teacher-generated responses (Sequential KD), not yet supported. Default is False.
 - temperature: Temperature for sampling and loss computation. Default is 0.9.
-- offload_teacher_model: Whether to offload teacher model to CPU to save GPU memory. Default is False.
 - sft_alpha: Mixing coefficient for SFT loss, `loss = jsd_loss + sft_alpha * sft_loss`. Takes effect when using dataset responses (Off-Policy). Default is 0.
 - max_completion_length: Maximum tokens for generation. Default is 512.
 - vllm_mode: Same as GRPO parameter, used for On-Policy generation. Colocate mode deploys vLLM within the program.
   - Note: On-Policy generation requires vLLM (`--use_vllm true --vllm_mode colocate/server`).
   - When `lmbda > 0` but vLLM is not enabled, it will automatically fall back to Off-Policy mode.
+
+### Teacher Parameters
+
+Used in GKD and GRPO.
+
+- teacher_model: Path or model ID of the teacher model. Required.
+- teacher_model_type: Teacher model type. Default is None, auto-detected.
+- teacher_model_revision: Teacher model version. Default is None.
+- teacher_model_server: Teacher model service URL. Deploy via `swift deploy` for logprobs; mutually exclusive with `teacher_model`. Single URL or multi-teacher JSON (`'[{"url":"...","tags":["..."]}, ...]'`). See [distillation docs](../Instruction/Distillation.md#multi-teacher-routing).
+- teacher_tag_key: Column name for multi-teacher routing (match sample values to teacher `tags`). Default is `"dataset"`.
+- offload_teacher_model: Whether to offload teacher model to CPU to save GPU memory. Default is False.
 
 ## Export Parameters
 

@@ -36,10 +36,10 @@ completions = rollout_function(
 )
 """
 completions = [
-    (completion 1) "The larger number is 9.11...",
-    (completion 2) "9.9 is bigger than...",
+    (completion 1) "The larger number is 9.9...",
+    (completion 2) "9.11 is bigger than...",
     ...
-    (completion 8) "After calculation, 9.11..."
+    (completion 8) "After calculation, 9.9..."
 ]
 """
 
@@ -47,7 +47,7 @@ completions = [
 # Evaluate generated completions using reward model
 rewards = reward_function(
     completions=completions,
-    ground_truth="9.11"  # Expected correct answer
+    ground_truth="9.9"  # Expected correct answer
 )
 """
 rewards = [
@@ -189,7 +189,7 @@ swift rollout \
 ```
 For more rollout parameters, refer to the [vllm arguments](../../../Instruction/Command-line-parameters.md#vllm-arguments) and [rollout arguments](../../../Instruction/Command-line-parameters.md#rollout-arguments)
 
-Note: When set `use_async_engine`, enabling only DP (Data Parallelism) may cause errors. [Related issue](https://github.com/vllm-project/vllm/issues/18567). If errors occur, try enabling both TP (Tensor Parallelism) and DP or upgrading vLLM.
+Note: When set `vllm_use_async_engine`, enabling only DP (Data Parallelism) may cause errors. [Related issue](https://github.com/vllm-project/vllm/issues/18567). If errors occur, try enabling both TP (Tensor Parallelism) and DP or upgrading vLLM.
 
 To configure the external vLLM server during training, use the following parameters:
 

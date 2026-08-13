@@ -109,6 +109,19 @@ class ReactCompatMixin:
                 res.append(tool_message['content'])
         return assistant_content, res
 
+    def _format_react_standalone_tool_responses(self, tool_messages) -> 'Prompt':
+        assert len(tool_messages) > 0
+        res = []
+        for tool_message in tool_messages:
+            tool_content = tool_message['content']
+            res.extend(['\n', self.keyword.observation, '\n', tool_content])
+        return res
+
+    def _format_standalone_tool_responses(self, tool_messages) -> 'Prompt':
+        """Format observations that do not follow an assistant tool call."""
+        raise NotImplementedError(
+            f'Agent template {self.__class__.__name__} does not support standalone tool responses.')
+
     @staticmethod
     def _parse_tool_call(content) -> Dict[str, Any]:
         obj = BaseAgentTemplate._parse_json(content)
@@ -152,6 +165,21 @@ class BaseAgentTemplate(ReactCompatMixin, ABC):
     - `_format_tool_responses`: Format tool execution results
     - `get_toolcall`: Extract tool calls from agent responses
     """
+
+    def _add_tool_call_prefix(self, tool_content: str, pre_message=None) -> str:
+        """Hook to prepend a separator before tool_call content based on the preceding message.
+
+        Subclasses can override this to match their jinja template's separator logic
+        (e.g., Qwen3.5/3.6 inserts '\n\n' when assistant has effective content before tool_calls).
+
+        Args:
+            tool_content: The formatted tool_call string from _format_tool_calls.
+            pre_message: The message immediately before the tool_call block, or None.
+
+        Returns:
+            tool_content with any necessary prefix prepended.
+        """
+        return tool_content
 
     @staticmethod
     def _get_tool_name(tool):

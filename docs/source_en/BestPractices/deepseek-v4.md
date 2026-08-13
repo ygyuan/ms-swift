@@ -11,7 +11,7 @@ pip install git+https://github.com/modelscope/mcore-bridge.git
 pip install git+https://github.com/modelscope/ms-swift.git
 
 # Megatron-LM is tested under the following commit hash
-# pip install git+https://github.com/NVIDIA/Megatron-LM.git@9af7c7937b6123bb0b22be4d8eb28a8ebf407d7d
+# pip install git+https://github.com/NVIDIA/Megatron-LM.git@fd1121b8ff7e3a4f83a28d35aed172d7bc0260e1
 ```
 
 ## Precision Alignment
@@ -192,7 +192,13 @@ Tips:
 --pipeline_model_parallel_size 8 \
 --pipeline_model_parallel_layout Et*5|t*5|t*6|t*6|t*6|t*5|t*5|t*5mL \
 ```
-- `padding_free` and `packing` are not yet supported, but you can use `group_by_length` to speed up training. TP is also not yet supported, pending Megatron-Core support.
+- Packing/CP support: Requires installing the mcore-bridge/ms-swift main branch. Refer to these two PRs: [ms-swift#9705](https://github.com/modelscope/ms-swift/pull/9705), [mcore-bridge#140](https://github.com/modelscope/mcore-bridge/pull/140). To use CP, you need to additionally configure:
+
+```
+--sequence_packing_scheduler dp_balanced \
+--cp_partition_mode contiguous \
+```
+- TP is not supported for now, pending support from Megatron-Core.
 - FP8 training: you can enable FP8 training and save the weights in FP8 by setting the parameters below. Full-parameter training is recommended. If you want to use LoRA + FP8, you should save only the LoRA weights (set `--merge_lora false`) and perform Merge-LoRA against the BF16 weights (FP8 has limited precision and the LoRA delta would be rounded to 0). See [this example](https://github.com/modelscope/ms-swift/blob/main/examples/megatron/fp8/lora.sh).
 ```
 --fp8_recipe blockwise \
@@ -214,3 +220,41 @@ swift infer \
 Inference result:
 
 ![result](../../resources/deepseek_v4/infer_result.png)
+
+Running vLLM inference:
+
+- If you want to use vLLM for inference, you can refer to [this documentation](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash). You need FP4/FP8 precision weights.
+- Additionally, you need to copy the original 'config.json' file and modify 'expert_dtype' (consistent with the config.json after training). This is because the file saved by transformers' `config.save_pretrained` differs from the original file, and vLLM is not compatible with the saved file.
+- If you encounter tilelang issues, you can check [this issue](https://github.com/modelscope/ms-swift/issues/9494).
+- mcore-bridge DeepSeek-V4 FP8 fix: [PR](https://github.com/modelscope/mcore-bridge/pull/133).
+
+First perform quantization (note: this quantization will cause LoRA incremental information loss; this is only an example. It is recommended to use FP8 full-parameter training and export FP8 weights):
+
+```shell
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NPROC_PER_NODE=8 \
+megatron export \
+    --model megatron_output/DeepSeek-V4-Flash/vx-xxx/checkpoint-xxx-merged \
+    --output_dir megatron_output/DeepSeek-V4-Flash/vx-xxx/checkpoint-xxx-merged-FP8 \
+    --to_hf true \
+    --fp8_recipe blockwise \
+    --fp8_format e4m3 \
+    --fp8_param_gather true \
+    --mtp_num_layers 1 \
+    --expert_model_parallel_size 8
+```
+
+vLLM launch command:
+```shell
+vllm serve megatron_output/DeepSeek-V4-Flash/vx-xxx/checkpoint-xxx-merged-FP8 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    --enable-expert-parallel \
+    --tensor-parallel-size 8 \
+    --max-model-len 8192 \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4
+```

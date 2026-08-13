@@ -1,10 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import sys
+import torch
 from transformers import AutoModel, PretrainedConfig, PreTrainedModel
+from types import MethodType
 from typing import Any, Dict
 
 from swift.template import TemplateType
-from swift.utils import Processor, git_clone_github
+from swift.utils import Processor, get_logger, git_clone_github
 from ..constant import LLMModelType, MLLMModelType
 from ..model_arch import ModelArch
 from ..model_meta import Model, ModelGroup, ModelMeta
@@ -177,6 +179,10 @@ register_model(
                 Model('deepseek-ai/DeepSeek-V4-Pro', 'deepseek-ai/DeepSeek-V4-Pro'),
                 Model('deepseek-ai/DeepSeek-V4-Pro-Base', 'deepseek-ai/DeepSeek-V4-Pro-Base'),
             ]),
+            ModelGroup([
+                Model('deepseek-ai/DeepSeek-V4-Flash-0731', 'deepseek-ai/DeepSeek-V4-Flash-0731'),
+            ],
+                       template=TemplateType.deepseek_v4_flash),
         ],
         template=TemplateType.deepseek_v4,
         architectures=['DeepseekV4ForCausalLM'],
@@ -372,6 +378,159 @@ register_model(
         template=TemplateType.deepseek_ocr2,
         model_arch=ModelArch.deepseek_ocr2,
         architectures=['DeepseekOCR2ForCausalLM'],
+        requires=['transformers==4.46.3', 'easydict'],
+        tags=['vision'],
+    ))
+
+
+class UnlimitedOCRLoader(DeepseekOCRLoader):
+    visual_name = 'vision_model'
+
+    @staticmethod
+    def _apply_multi_gpu_patch():
+        modeling_module = None
+        for mod_name, mod in sys.modules.items():
+            if 'modeling_unlimitedocr' in mod_name:
+                modeling_module = mod
+                break
+
+        if modeling_module is None:
+            return False
+
+        UnlimitedOCRModel = getattr(modeling_module, 'UnlimitedOCRModel', None)
+        if UnlimitedOCRModel is None:
+            return False
+
+        if getattr(UnlimitedOCRModel, '_swift_multi_gpu_patched', False):
+            return True
+
+        _original_forward = UnlimitedOCRModel.forward
+
+        def _patched_forward(self, *args, **kwargs):
+            _orig_cat = torch.cat
+            _orig_masked_scatter_ = torch.Tensor.masked_scatter_
+
+            def _safe_cat(tensors, dim=0, **cat_kwargs):
+                # Using the device of the first tensor as the reference, the others are aligned to it.
+                ref_device = None
+                for t in tensors:
+                    if isinstance(t, torch.Tensor):
+                        ref_device = t.device
+                        break
+                if ref_device is None:
+                    return _orig_cat(tensors, dim, **cat_kwargs)
+                aligned = [
+                    t.to(ref_device) if isinstance(t, torch.Tensor) and t.device != ref_device else t for t in tensors
+                ]
+                return _orig_cat(aligned, dim, **cat_kwargs)
+
+            def _safe_masked_scatter_(tensor_self, mask, source):
+                # Use the device of tensor_self (inputs_embeds[idx]) as the reference.
+                dev = tensor_self.device
+                if mask.device != dev:
+                    mask = mask.to(dev)
+                if source.device != dev:
+                    source = source.to(dev)
+                return _orig_masked_scatter_(tensor_self, mask, source)
+
+            modeling_module.torch.cat = _safe_cat
+            torch.cat = _safe_cat
+            torch.Tensor.masked_scatter_ = _safe_masked_scatter_
+            try:
+                return _original_forward(self, *args, **kwargs)
+            finally:
+                # Restore state
+                modeling_module.torch.cat = _orig_cat
+                torch.cat = _orig_cat
+                torch.Tensor.masked_scatter_ = _orig_masked_scatter_
+
+        UnlimitedOCRModel.forward = _patched_forward
+        UnlimitedOCRModel._swift_multi_gpu_patched = True
+        return True
+
+    def get_model(self, model_dir: str, config, *args, **kwargs) -> PreTrainedModel:
+        logger = get_logger()
+
+        self.auto_model_cls = self.auto_model_cls or AutoModel
+
+        def to_dict(self, *args, **kwargs):
+            res = self._to_dict(*args, **kwargs)
+            if 'language_config' in res and res['language_config'].get('torch_dtype') is not None:
+                dtype = res['language_config']['torch_dtype']
+                res['language_config']['torch_dtype'] = str(dtype).replace('torch.', '')
+            res.pop('to_dict')
+            res.pop('_to_dict')
+            return res
+
+        config._to_dict = config.to_dict
+        config.to_dict = MethodType(to_dict, config)
+
+        model = super(DeepseekOCRLoader, self).get_model(model_dir, config, *args, **kwargs)
+        patch_output_clone(model.model.embed_tokens)
+        patch_output_to_input_device(model.model.sam_model)
+        patch_output_to_input_device(getattr(model.model, self.visual_name))
+        patch_output_to_input_device(model.model.projector)
+        patch_output_to_input_device(model.model)
+
+        _orig_sw = getattr(model.config, 'sliding_window_size', None)
+        if _orig_sw is not None:
+            model.config._ring_window = _orig_sw
+            logger.info('[UnlimitedOCR] R-SWA enabled: ring_window=%d', _orig_sw)
+            # Patch _prepare_4d_causal_attention_mask in the main process (where model.forward runs).
+            # Without this, transformers mangles 4D R-SWA masks (0/-inf) by treating them as 0/1 binary.
+            # Find DeepseekV2Model's module via MRO
+            for cls in type(model.model).__mro__:
+                if cls.__name__ == 'DeepseekV2Model':
+                    mod = sys.modules[cls.__module__]
+                    if not getattr(mod, '_rswa_patched_global', False):
+                        _orig_fn = mod._prepare_4d_causal_attention_mask
+
+                        def _passthrough_4d(attention_mask, *args, **kwargs):
+                            if attention_mask is not None and attention_mask.ndim == 4:
+                                return attention_mask
+                            return _orig_fn(attention_mask, *args, **kwargs)
+
+                        mod._prepare_4d_causal_attention_mask = _passthrough_4d
+                        mod._rswa_patched_global = True
+                        logger.info('[UnlimitedOCR] Patched _prepare_4d_causal_attention_mask in module %s',
+                                    cls.__module__)
+                    break
+        else:
+            logger.warning('[UnlimitedOCR] sliding_window_size config not found, R-SWA may not work.')
+
+        # Fix device placement for bare nn.Parameter (image_newline, view_seperator)
+        # These are used in torch.cat inside forward, so patch_output_to_input_device can't help.
+        try:
+            vision_device = next(model.model.vision_model.parameters()).device
+            model.model.image_newline.data = model.model.image_newline.data.to(vision_device)
+            model.model.view_seperator.data = model.model.view_seperator.data.to(vision_device)
+        except Exception as e:
+            logger.warning('[UnlimitedOCR] Failed to fix parameter device: %s', e)
+
+        n_devices = len(set(str(p.device) for p in model.parameters() if p.device.type == 'cuda'))
+        if n_devices > 1:
+            if self._apply_multi_gpu_patch():
+                logger.info('[UnlimitedOCR] Multi-GPU patch applied (%d GPUs).', n_devices)
+            else:
+                logger.warning('[UnlimitedOCR] Multi-GPU deployment failed to apply patch.'
+                               'If an inference error occurs, please check whether'
+                               ' `modeling_unlimitedocr` has been loaded correctly.')
+
+        return model
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.unlimited_ocr,
+        [
+            ModelGroup([
+                Model('PaddlePaddle/Unlimited-OCR', 'PaddlePaddle/Unlimited-OCR'),
+            ]),
+        ],
+        UnlimitedOCRLoader,
+        template=TemplateType.unlimited_ocr,
+        model_arch=ModelArch.unlimited_ocr,
+        architectures=['UnlimitedOCRForCausalLM'],
         requires=['transformers==4.46.3', 'easydict'],
         tags=['vision'],
     ))

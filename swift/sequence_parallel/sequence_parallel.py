@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import math
 import torch
 import torch.distributed as dist
-from functools import partial
+from functools import lru_cache, partial
 from torch.distributed import init_device_mesh
 from transformers import PreTrainedTokenizer
 from types import SimpleNamespace
@@ -11,6 +12,53 @@ from typing import Optional
 from swift.utils import HfConfigFactory, get_cu_seqlens_from_position_ids, get_device, get_dist_setting
 from .ulysses import DistributedAttention
 from .zigzag_ring_attn import zigzag_ring_flash_attn_varlen_func
+
+
+@lru_cache(maxsize=None)
+def get_signature_parameters(fn):
+    try:
+        return inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return None
+
+
+def has_signature_parameter(fn, parameter: str) -> bool:
+    parameters = get_signature_parameters(fn)
+    return parameters is not None and parameter in parameters
+
+
+def call_with_supported_kwargs(fn, *args, **kwargs):
+    parameters = get_signature_parameters(fn)
+    if parameters is None:
+        return fn(*args, **kwargs)
+    if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+    return fn(*args, **kwargs)
+
+
+def _call_create_causal_mask(fn, config, input_embeds, attention_mask, cache_position_or_past_key_values, *args,
+                             **kwargs):
+    if has_signature_parameter(fn, 'cache_position'):
+        return call_with_supported_kwargs(
+            fn,
+            config,
+            input_embeds,
+            attention_mask,
+            cache_position_or_past_key_values,
+            *args,
+            **kwargs,
+        )
+    if cache_position_or_past_key_values is None and 'past_key_values' in kwargs:
+        return call_with_supported_kwargs(fn, config, input_embeds, attention_mask, *args, **kwargs)
+    return call_with_supported_kwargs(
+        fn,
+        config,
+        input_embeds,
+        attention_mask,
+        cache_position_or_past_key_values,
+        *args,
+        **kwargs,
+    )
 
 
 class SequenceParallel:
@@ -75,17 +123,27 @@ class SequenceParallel:
                 'sdpa_origin'] = masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa']
             masking_utils.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping['sdpa'] = sdpa_mask
 
-            def create_causal_mask(config, input_embeds, attention_mask, cache_position, *args, **kwargs):
+            def create_causal_mask(config,
+                                   input_embeds,
+                                   attention_mask,
+                                   cache_position_or_past_key_values=None,
+                                   *args,
+                                   **kwargs):
                 if self.world_size == 1:
-                    return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                                   *args, **kwargs)
+                    return _call_create_causal_mask(masking_utils.origin_create_causal_mask, config, input_embeds,
+                                                    attention_mask, cache_position_or_past_key_values, *args, **kwargs)
                 input_embeds = torch.ones(
                     (input_embeds.shape[0], input_embeds.shape[1] * self.sp_world_size, input_embeds.shape[2]),
                     dtype=input_embeds.dtype,
                     device=input_embeds.device)
-                cache_position = torch.arange(0, input_embeds.shape[1], device=input_embeds.device)
-                return masking_utils.origin_create_causal_mask(config, input_embeds, attention_mask, cache_position,
-                                                               *args, **kwargs)
+                if has_signature_parameter(masking_utils.origin_create_causal_mask, 'cache_position'):
+                    cache_position_or_past_key_values = torch.arange(
+                        0,
+                        input_embeds.shape[1],
+                        device=input_embeds.device,
+                    )
+                return _call_create_causal_mask(masking_utils.origin_create_causal_mask, config, input_embeds,
+                                                attention_mask, cache_position_or_past_key_values, *args, **kwargs)
 
             masking_utils.origin_create_causal_mask = masking_utils.create_causal_mask
             masking_utils.create_causal_mask = create_causal_mask
@@ -161,14 +219,22 @@ class SequenceParallel:
                             group=self.rp_group)
                         return output
                     else:
-                        if 'cu_seq_lens_q' in kwargs:
-                            position_ids = kwargs.get('position_ids')
-                            if self.real_position_ids is not None:
-                                position_ids = self.real_position_ids
+                        position_ids = kwargs.get('position_ids')
+                        if self.real_position_ids is not None:
+                            position_ids = self.real_position_ids
+                        # Our -1 padding makes transformers' `_is_packed_sequence` see a single varlen sequence
+                        # whenever the batch has one row -- no matter whether padding_free is on -- yet since
+                        # 5.15.0 it derives the lengths from `position_ids == position_ids.min()` instead of `== 0`
+                        # (huggingface/transformers#47525), reading that -1 as the only sequence start. Supply the
+                        # lengths ourselves, and only for that same single-row case.
+                        if position_ids is not None and query.shape[0] == 1:
                             position_ids = self.pad(position_ids, padding_value=-1, position_ids=position_ids)
                             cu_seqlens = get_cu_seqlens_from_position_ids(position_ids)
                             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-                            assert query.shape[2] == cu_seqlens[-1]
+                            # `query` is (batch, heads, seq, head_dim) here, i.e. after the all-to-all it spans the
+                            # whole sequence, so its length must match the total the lengths account for.
+                            assert query.shape[2] == cu_seqlens[-1], (
+                                f'query.shape: {tuple(query.shape)}, cu_seqlens: {cu_seqlens.tolist()}')
                             kwargs['cu_seq_lens_q'] = cu_seqlens
                             kwargs['cu_seq_lens_k'] = cu_seqlens
                             kwargs['max_length_q'] = max_seqlen

@@ -21,6 +21,7 @@ class LLMTemplateType:
     qwen3_reranker = 'qwen3_reranker'
     qwq_preview = 'qwq_preview'
     qwq = 'qwq'
+    nemotron_h = 'nemotron_h'
     yufeng_xguard = 'yufeng_xguard'
     marco_o1 = 'marco_o1'
     modelscope_agent = 'modelscope_agent'
@@ -70,6 +71,7 @@ class LLMTemplateType:
     deepseek_r1 = 'deepseek_r1'
     deepseek_v3_1 = 'deepseek_v3_1'
     deepseek_v4 = 'deepseek_v4'
+    deepseek_v4_flash = 'deepseek_v4_flash'
 
     openbuddy = 'openbuddy'
     openbuddy2 = 'openbuddy2'
@@ -111,6 +113,7 @@ class LLMTemplateType:
     dots1 = 'dots1'
     hunyuan_moe = 'hunyuan_moe'
     hunyuan = 'hunyuan'
+    hy_v3_preview = 'hy_v3_preview'
     hy_v3 = 'hy_v3'
     ernie = 'ernie'
     ernie_thinking = 'ernie_thinking'
@@ -142,6 +145,7 @@ class MLLMTemplateType:
     qwen3_omni = 'qwen3_omni'
     qwen2_audio = 'qwen2_audio'
     qwen3_asr = 'qwen3_asr'
+    qwen3_tts = 'qwen3_tts'
     qwen3_vl = 'qwen3_vl'
     qwen3_vl_emb = 'qwen3_vl_emb'
     qwen3_vl_reranker = 'qwen3_vl_reranker'
@@ -153,7 +157,9 @@ class MLLMTemplateType:
     ovis1_6_llama3 = 'ovis1_6_llama3'
     ovis2 = 'ovis2'
     ovis2_5 = 'ovis2_5'
+    ovis_ocr2 = 'ovis_ocr2'
     mimo_vl = 'mimo_vl'
+    mimo_v2 = 'mimo_v2'
     midashenglm = 'midashenglm'
 
     llama3_1_omni = 'llama3_1_omni'
@@ -224,6 +230,7 @@ class MLLMTemplateType:
     deepseek_janus_pro = 'deepseek_janus_pro'
     deepseek_ocr = 'deepseek_ocr'
     deepseek_ocr2 = 'deepseek_ocr2'
+    unlimited_ocr = 'unlimited_ocr'
 
     mplug_owl2 = 'mplug_owl2'
     mplug_owl3 = 'mplug_owl3'
@@ -239,6 +246,7 @@ class MLLMTemplateType:
     step_audio2_mini = 'step_audio2_mini'
     kimi_vl = 'kimi_vl'
     kimi_k25 = 'kimi_k25'
+    kimi_k3 = 'kimi_k3'
     keye_vl = 'keye_vl'
     keye_vl_1_5 = 'keye_vl_1_5'
     dots_ocr = 'dots_ocr'
@@ -268,6 +276,7 @@ class MLLMTemplateType:
     hunyuan_ocr = 'hunyuan_ocr'
     step3_vl = 'step3_vl'
     minimax_m3_vl = 'minimax_m3_vl'
+    muse_glimmer = 'muse_glimmer'
 
 
 class TemplateType(LLMTemplateType, MLLMTemplateType, RMTemplateType):

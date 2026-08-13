@@ -13,6 +13,7 @@ from functools import partial
 from mcore_bridge import LoraParallelLinear
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -22,7 +23,6 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from modelscope import check_local_model_is_latest
 from packaging import version
 from pathlib import Path
-from transformers.utils import is_torch_npu_available
 from typing import Callable, Dict, List, Optional
 
 from swift.dataset import RowPreprocessor
@@ -137,11 +137,14 @@ class BaseMegatronTrainer(ABC):
         if config.num_moe_experts is not None:
             moe_loss_scale = 1 / args.num_microbatches / n_steps
             track_names = []
-            if config.moe_router_load_balancing_type == 'aux_loss':
+            load_balancing_type = config.moe_router_load_balancing_type
+            if isinstance(load_balancing_type, str):
+                load_balancing_type = [load_balancing_type]
+            if 'aux_loss' in load_balancing_type:
                 track_names.append('load_balancing_loss')
-            elif config.moe_router_load_balancing_type == 'seq_aux_loss':
+            if 'seq_aux_loss' in load_balancing_type:
                 track_names.append('seq_load_balancing_loss')
-            elif config.moe_router_load_balancing_type == 'global_aux_loss':
+            if 'global_aux_loss' in load_balancing_type:
                 track_names.append('global_load_balancing_loss')
             if config.moe_z_loss_coeff is not None:
                 track_names.append('z_loss')
@@ -592,7 +595,7 @@ class BaseMegatronTrainer(ABC):
                 self._prepare_vit_gradient_checkpointing(m)
 
         config.grad_scale_func = self.optimizer.scale_loss
-        if isinstance(self.wrapped_models[0], DDP) and args.overlap_grad_reduce:
+        if isinstance(self.wrapped_models[0], (DDP, megatron_FSDP)) and args.overlap_grad_reduce:
             assert config.no_sync_func is None, ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
                                                  'a custom no_sync_func is not supported when overlapping grad-reduce')
             config.no_sync_func = [model_chunk.no_sync for model_chunk in self.wrapped_models]
@@ -614,6 +617,37 @@ class BaseMegatronTrainer(ABC):
             disable_forward_pre_hook(self.wrapped_models, param_sync=False)
             self._saved_param_sync_func = config.param_sync_func
             config.param_sync_func = None
+
+        if args.nccl_comm_warmup:
+            # Eagerly create NCCL communicators while GPU memory is still free. Lazily-initialized
+            # comms (e.g. the dp/cp loss all-reduce and grad-sync coalescing) otherwise first fire
+            # at the iteration-1 memory peak, where NCCL's internal cudaMalloc can fail with
+            # "Failed to CUDA calloc async N bytes". A 1-element dummy all-reduce per group is
+            # numerically inert and forces the communicator to be created up front.
+            dummy = torch.zeros(1, device=get_current_device())
+            warmed = 0
+            for getter, kwargs in (
+                (mpu.get_data_parallel_group, {
+                    'with_context_parallel': True
+                }),
+                (mpu.get_data_parallel_group, {}),
+                (mpu.get_context_parallel_group, {}),
+                (mpu.get_tensor_model_parallel_group, {}),
+                (mpu.get_pipeline_model_parallel_group, {}),
+                (mpu.get_model_parallel_group, {}),
+                (mpu.get_embedding_group, {}),
+                (mpu.get_position_embedding_group, {}),
+            ):
+                try:
+                    group = getter(**kwargs)
+                except (AssertionError, ValueError, TypeError):
+                    continue
+                for g in (group if isinstance(group, list) else [group]):
+                    if g is not None:
+                        torch.distributed.all_reduce(dummy, group=g)
+                        warmed += 1
+            torch.cuda.synchronize()
+            logger.info(f'NCCL communicator warm-up done ({warmed} groups).')
 
         self.call_event('on_train_begin')
         self._train_metrics = {}
@@ -766,6 +800,7 @@ class BaseMegatronTrainer(ABC):
         if args.save_safetensors:
             skip_saving_adapter = args.tuner_type == 'lora_llm' or (
                 args.tuner_type == 'lora' and args.merge_lora and not hasattr(self.bridge, '_support_hf_grouped_lora'))
+            save_missing_weights = args.save_missing_weights and args.model_dir
 
             if not skip_saving_adapter:
                 self.bridge.save_weights(
@@ -774,6 +809,7 @@ class BaseMegatronTrainer(ABC):
                     peft_format=args.tuner_type == 'lora',
                     args=args,
                     processor=self.template.processor,
+                    save_missing_weights=save_missing_weights,
                 )
             # merge-lora does not store lora, lora saving may report an error (Qwen3-VL-Moe)
             if args.tuner_type != 'full' and args.merge_lora:
@@ -795,6 +831,7 @@ class BaseMegatronTrainer(ABC):
                     peft_format=False,
                     args=args,
                     processor=self.template.processor,
+                    save_missing_weights=save_missing_weights,
                 )
                 self.unmerge_lora_adapters()
 
@@ -981,10 +1018,6 @@ class BaseMegatronTrainer(ABC):
     @abstractmethod
     def forward_step(self, data_iterator, model):
         pass
-
-    def _should_use_npu_generated_attention_mask(self, args) -> bool:
-        return (is_torch_npu_available() and args.task_type == 'causal_lm' and not args.padding_free
-                and getattr(args, 'attention_backend', None) != 'local' and getattr(args, 'use_flash_attn', False))
 
     def _prepare_batch(self, data, vp_stage=None):
         return prepare_batch(self.args, data, vp_stage=vp_stage)

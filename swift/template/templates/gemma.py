@@ -11,7 +11,7 @@ from ..constant import LLMTemplateType, MLLMTemplateType
 from ..register import TemplateMeta, register_template
 from ..template_inputs import StdTemplateInputs
 from ..utils import Context, Prompt, Word, findall
-from ..vision_utils import load_audio
+from ..vision_utils import load_audio, load_vllm_video
 
 logger = get_logger()
 
@@ -108,6 +108,8 @@ class Gemma3VisionTemplate(Gemma3Template):
         from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
 
         encoded = super()._encode(inputs)
+        # Keep text-only rows aligned with multimodal rows in mixed batches.
+        encoded['token_type_ids'] = [0] * len(encoded['input_ids'])
         if inputs.images:
             input_ids = encoded['input_ids']
             labels = encoded['labels']
@@ -259,16 +261,14 @@ class Gemma4Template(Template):
             return ['<|audio|>']
         elif media_type == 'video':
             if self.mode == 'vllm':
-                from vllm.assets.video import video_get_metadata, video_to_ndarrays
                 num_frames = self.processor.video_processor.num_frames
-                video_data = video_to_ndarrays(inputs.videos[index], num_frames)
-                video_metadatas = video_get_metadata(inputs.videos[index], num_frames)
+                video_data, video_metadatas = load_vllm_video(inputs.videos[index], num_frames)
                 inputs.videos[index] = [(video_data, video_metadatas)]
             return ['<|video|>']
 
     def _get_system(self, inputs: StdTemplateInputs) -> Optional[str]:
         system = super()._get_system(inputs)
-        if not self.is_training and self._get_enable_thinking(inputs):
+        if self._get_enable_thinking(inputs):
             system = '<|think|>\n' + (system or '')
         return system
 
@@ -320,6 +320,15 @@ class Gemma4Template(Template):
         ]:
             if key in media_inputs:
                 encoded[key] = media_inputs[key]
+        # unpad input_features
+        # https://github.com/vllm-project/vllm/blob/v0.23.0/vllm/model_executor/models/gemma4_mm.py#L747-L758
+        if 'input_features' in encoded and 'input_features_mask' in encoded:
+            masks = encoded['input_features_mask']
+            features = encoded['input_features']
+            if isinstance(masks, torch.Tensor) and masks.ndim >= 2:
+                bool_masks = masks.bool()
+                encoded['input_features'] = torch.stack([f[m] for f, m in zip(features, bool_masks)])
+                encoded['input_features_mask'] = torch.stack([m[m] for m in bool_masks])
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
         encoded['loss_scale'] = loss_scale

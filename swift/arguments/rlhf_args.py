@@ -63,6 +63,9 @@ class TeacherModelArguments:
             When set, the teacher logprobs will be fetched from the external API service (e.g., swift deploy, vLLM)
             instead of loading a local teacher model. This enables using larger teacher models or services hosted
             remotely. When this is set, `teacher_model` is not required. Defaults to None.
+        offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
+            or OPD-RL training. When enabled, the teacher model is loaded to GPU only during forward pass and
+            offloaded back to CPU afterwards. Defaults to False.
     """
     teacher_model: Optional[str] = None
     teacher_adapters: List[str] = field(default_factory=list)
@@ -81,8 +84,10 @@ class TeacherModelArguments:
         metadata={
             'help':
             'URL of the teacher model server (e.g., http://localhost:8000). '
-            'When set, teacher logprobs are fetched via API instead of loading a local model.'
+            'When set, teacher logprobs are fetched via API instead of loading a local model. '
+            'Supports multi-teacher via JSON list of {url, tags}.'
         })
+    offload_teacher_model: bool = False
 
 
 @dataclass
@@ -215,14 +220,12 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         sft_alpha (float): The weight for the SFT loss component in GKD. The final loss is calculated as
             gkd_loss + sft_alpha * sft_loss`. Defaults to 0.
         lmbda (float): The lambda parameter for GKD, balancing policy and value losses. Defaults to 0.5.
-        seq_kd (bool): Whether to use sequence-level knowledge distillation for GKD. Defaults to False.
+        seq_kd (bool): Deprecated. Sequential KD (teacher-generated responses) is not implemented.
         gkd_logits_topk (Optional[int]): The number of top-k logits to use for KL divergence computation in GKD.
             If None, uses full vocabulary for KL computation (more accurate but memory-intensive).
             If set to a positive integer, only top-k teacher logits are used (more efficient).
             When using `teacher_model_server`, this is limited by the server's `max_logprobs` setting
             (vLLM default is 20, can be increased with `--max-logprobs`). Defaults to None.
-        offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
-            training. Defaults to False.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
     """
@@ -257,9 +260,8 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     # GKD
     sft_alpha: float = 0
     lmbda: float = 0.5
-    seq_kd: bool = False
+    seq_kd: bool = False  # Deprecated
     gkd_logits_topk: Optional[int] = None
-    offload_teacher_model: bool = False
     # compat
     max_new_tokens: Optional[int] = None  # use max_completion_length instead
 
@@ -280,6 +282,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         GRPOArguments.__post_init__(self)
         SftArguments.__post_init__(self)
         self._check_sequence_parallel()
+        self._check_teacher()
         self._check_grpo()
         self._check_gkd()
 
@@ -300,7 +303,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
                 # Avoid padding labels during the model's forward pass in multimodal models.
                 # Some multimodal models do not expand the image pad token.
                 self.loss_scale = 'default'
-            elif self.rlhf_type == 'grpo':
+            elif self.rlhf_type in ('grpo', 'gkd'):
                 if self.multi_turn_scheduler:
                     self.loss_scale = 'default'
                 else:
@@ -388,9 +391,54 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             else:
                 raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
 
+    def _check_teacher(self):
+        self._teacher_use_disable_adapter = False
+
+        if self.rlhf_type not in ['grpo', 'gkd']:
+            if self.teacher_model is not None or self.teacher_model_server is not None:
+                logger.warning(f'teacher_model / teacher_model_server is ignored for rlhf_type={self.rlhf_type!r} '
+                               '(only used by gkd and grpo/OPD-RL).')
+            return
+        teacher_set = self.teacher_model is not None or self.teacher_model_server is not None
+        if not teacher_set:
+            if self.rlhf_type == 'gkd':
+                logger.info('No teacher_model specified. Using self-distillation mode (teacher = student).')
+                if self.use_liger_kernel:
+                    raise ValueError('Self-distillation mode with liger kernel loss is not supported yet')
+            if self.rlhf_type == 'grpo' and self.num_generations == 1:
+                raise ValueError('num_generations must be greater than 1 for GRPO')
+            return
+
+        if self.rlhf_type == 'grpo' and self.use_liger_kernel:
+            raise ValueError('OPD-RL is not supported with use_liger_kernel.')
+
+        if self.teacher_model is not None and self.teacher_model_server is not None:
+            raise ValueError('setting both `teacher_model` and `teacher_model_server` is not supported.')
+
+        # Validate teacher_model_server: accept single URL or JSON multi-teacher config.
+        if self.teacher_model_server is not None:
+            from swift.rlhf_trainers.gkd_helpers import parse_teacher_model_server
+
+            # Parse early to fail fast on invalid JSON; result is re-parsed by the trainer.
+            parse_teacher_model_server(self.teacher_model_server)
+
+        # Self-distillation: teacher_model == student model
+        if self.teacher_model is not None and self.teacher_model == self.model:
+            if self.tuner_type == 'lora':
+                logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
+                self._teacher_use_disable_adapter = True
+                self.teacher_model = None
+            else:
+                # Full training + same teacher_model: a separate frozen copy will be loaded as fixed teacher.
+                pass
+
     def _init_rollout(self):
         if self.rlhf_type not in rlhf_support_vllm_types:
             return
+
+        if self.use_vllm and os.getenv('SWIFT_AUDIO_LOAD_BACKEND') is None:
+            # align with vLLM audio load backend
+            os.environ['SWIFT_AUDIO_LOAD_BACKEND'] = 'soundfile_pyav'
 
         if self.vllm_mode is not None and not self.use_vllm:
             raise ValueError('vllm_mode is not supported when use_vllm is false')
@@ -519,6 +567,135 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         if self.async_generate and self.multi_turn_scheduler is not None:
             raise NotImplementedError('Currently, async_generate is not supported with multi-turn functionality.')
 
+        self._check_opd_rl()
+        self._check_rlsd()
+        self._check_sdar()
+
+    def _check_rlsd(self):
+        """Validate RLSD (Self-Distilled RLVR) advantage reweighting parameters.
+
+        RLSD reweights the per-sequence GRPO advantage per token using the teacher-vs-student
+        logprob gap. It relies on an OPSD teacher forward driven by a per-sample ``teacher_prompt``
+        column (privileged context, e.g. question + reference solution / GT answer). It also needs
+        an environment reward (``reward_funcs``) because the reweight direction uses ``sign(A)``.
+
+        Two teacher modes are supported (mirroring the reference's ``freeze_teacher_model`` flag):
+
+        * **Dynamic self-distillation** (no ``--teacher_model``, default): teacher = current policy
+          evaluated on the privileged prompt (paper's same-model, two-contexts Δ_t; equivalent to
+          the reference's ``freeze_teacher_model=false``).
+        * **Frozen local teacher** (``--teacher_model <ckpt>``): a separate model scores the
+          privileged prompt under ``no_grad`` and is never in the optimizer, so it stays frozen
+          throughout training. Point ``--teacher_model`` at the initial policy checkpoint to
+          reproduce the reference's ``freeze_teacher_model=true`` (frozen θ₀ anchor).
+        """
+        if self.advantage_reweight != 'rlsd':
+            return
+        if not (0.0 <= self.rlsd_lambda <= 1.0):
+            raise ValueError(f'rlsd_lambda must be in [0, 1], got {self.rlsd_lambda}.')
+        if self.rlsd_reweight_clip_range < 0:
+            raise ValueError(f'rlsd_reweight_clip_range (eps_w) must be >= 0, got {self.rlsd_reweight_clip_range}.')
+        if not self.reward_funcs:
+            raise ValueError('advantage_reweight=rlsd requires reward_funcs: the reweight direction uses '
+                             'sign(A) of the GRPO advantage, which needs an environment reward.')
+        if self.use_liger_kernel:
+            raise ValueError('advantage_reweight=rlsd is not compatible with use_liger_kernel '
+                             '(the fused loss path bypasses the per-token RLSD reweight).')
+        if self.loss_type in ['real', 'fipo']:
+            raise ValueError(f'advantage_reweight=rlsd does not support loss_type={self.loss_type!r} '
+                             '(it reduces the advantage to a per-sequence scalar).')
+        if self.off_policy_sequence_mask_delta is not None:
+            raise ValueError('advantage_reweight=rlsd does not support off_policy_sequence_mask_delta.')
+        # Local frozen teacher (--teacher_model) is allowed: it drives the OPSD teacher forward on
+        # the privileged prompt via the same code path as OPD-RL, and use_rlsd bypasses OPD-RL's
+        # additive term (grpo_trainer.py:266) so there is no double-count. The API-teacher path
+        # (--teacher_model_server) scores tokens over a remote inference call whose tokenizer
+        # alignment with the student is not guaranteed, so keep it gated for RLSD's per-token reweight.
+        if self.teacher_model_server is not None:
+            raise ValueError('advantage_reweight=rlsd does not support --teacher_model_server (remote API '
+                             'teacher). Use --teacher_model <local ckpt> for a frozen local teacher, or omit '
+                             'both to use dynamic self-distillation (teacher = current policy).')
+        if self.beta not in (0, 0.0):
+            logger.warning(f'advantage_reweight=rlsd: the reference RLSD config disables KL (beta=0), '
+                           f'but beta={self.beta}. Consider setting --beta 0.')
+        if self.teacher_model is not None:
+            logger.info(f'advantage_reweight=rlsd: frozen-teacher mode — --teacher_model={self.teacher_model!r} scores '
+                        f'the `teacher_prompt` column under no_grad and stays frozen throughout training (matches the '
+                        f'RLSD reference freeze_teacher_model=true when this checkpoint is the initial policy).')
+        else:
+            logger.info('advantage_reweight=rlsd: dynamic self-distillation mode — expecting a `teacher_prompt` '
+                        'column in the dataset; teacher = current policy on the privileged prompt.')
+
+    def _check_sdar(self):
+        """Validate SDAR (Self-Distilled Agentic RL) confidence-gated distillation parameters.
+
+        SDAR adds a confidence-gated teacher distillation auxiliary loss to the GRPO policy loss:
+        ``loss = policy_loss + sdar_loss_coef * token-mean(sigmoid(gate_beta*Δ) * Δ)`` with
+        ``Δ = logP_T - logP_S``. It reuses the OPSD teacher forward driven by a per-sample
+        ``teacher_prompt`` column (privileged / skill-augmented context). Unlike RLSD it does NOT
+        modify the advantage, and the reference keeps a small KL (so KL is not forced off).
+
+        Two teacher modes are supported (mirroring the reference's self-distillation setup):
+
+        * **Dynamic self-distillation** (no ``--teacher_model``, default): teacher = current policy
+          on the privileged ``teacher_prompt`` (the reference ALFWorld/Search/WebShop setting).
+        * **Frozen local teacher** (``--teacher_model <ckpt>``): a separate model scores the
+          privileged prompt under ``no_grad`` and stays frozen throughout training.
+        """
+        if self.sdar_loss_coef <= 0:
+            return
+        if self.sdar_gate_beta <= 0:
+            raise ValueError(f'sdar_gate_beta must be > 0, got {self.sdar_gate_beta}.')
+        if self.use_liger_kernel:
+            raise ValueError('sdar_loss_coef>0 is not compatible with use_liger_kernel (the fused Liger '
+                             'loss path bypasses the per-token loss where the SDAR term is added).')
+        if self.advantage_reweight == 'rlsd':
+            raise ValueError('sdar_loss_coef>0 cannot be combined with advantage_reweight=rlsd: SDAR adds a '
+                             'confidence-gated distillation loss while RLSD reweights the advantage — pick one '
+                             'teacher-distillation mechanism.')
+        if self.teacher_model_server is not None:
+            raise ValueError('sdar_loss_coef>0 does not support --teacher_model_server (remote API teacher). '
+                             'Use --teacher_model <local ckpt> for a frozen local teacher, or omit both to use '
+                             'dynamic self-distillation (teacher = current policy on the `teacher_prompt`).')
+        if self.teacher_model is not None:
+            logger.info(f'SDAR (sdar_loss_coef={self.sdar_loss_coef}): frozen-teacher mode — '
+                        f'--teacher_model={self.teacher_model!r} scores the `teacher_prompt` column under no_grad '
+                        f'and stays frozen throughout training.')
+        else:
+            logger.info(f'SDAR (sdar_loss_coef={self.sdar_loss_coef}): dynamic self-distillation mode — expecting '
+                        'a `teacher_prompt` column in the dataset; teacher = current policy on the privileged '
+                        'prompt. Without teacher logps the SDAR loss is skipped (behaves as plain GRPO).')
+
+    def _check_opd_rl(self):
+        """Fail-fast OPD-RL (teacher distillation on GRPO) parameter compatibility.
+
+        A teacher turns GRPO into OPD-RL, where the teacher signal is a *per-token* advantage
+        (the signed teacher log-ratio). Features that require a *per-sequence* advantage (typically
+        sign-based judgments) or reward variance are incompatible; reject them here rather than
+        deep inside the loss / advantage code. ``_check_teacher`` has already run, so
+        ``_teacher_use_disable_adapter`` is resolved.
+        """
+        opd_rl = (
+            self.teacher_model is not None or self.teacher_model_server is not None
+            or self._teacher_use_disable_adapter)
+        if not opd_rl:
+            return
+        # loss types / masks that reduce the advantage to a per-sequence scalar (sign-based).
+        if self.loss_type in ['real', 'fipo']:
+            raise ValueError(f'OPD-RL (teacher) does not support loss_type={self.loss_type!r} '
+                             '(it needs a per-sequence advantage).')
+        if self.off_policy_sequence_mask_delta is not None:
+            raise ValueError('OPD-RL (teacher) does not support off_policy_sequence_mask_delta '
+                             '(it needs a per-sequence advantage).')
+        # Pure distillation (no reward functions): the base GRPO advantage is 0, so reward-variance
+        # driven features have no signal to act on.
+        if not self.reward_funcs:
+            if self.dynamic_sample:
+                raise ValueError('dynamic_sample requires reward_funcs (it filters groups by reward std); '
+                                 'pure OPD-RL distillation has no reward variance.')
+            if self.scale_rewards == 'gdpo':
+                raise ValueError("scale_rewards='gdpo' requires reward_funcs; pure OPD-RL distillation has none.")
+
     def _external_vllm_warning(self):
         if self.rlhf_type not in rlhf_support_vllm_types or not self.vllm_server_host:
             return
@@ -575,35 +752,12 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             raise ValueError('GKD with vLLM is not compatible with `device_map`. '
                              'Please set NPROC_PER_NODE equal to num_processes.')
 
-        if self.multi_turn_scheduler is not None:
-            raise NotImplementedError('Currently, multi_turn_scheduler is not supported for GKD.')
-
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
 
-        if self.teacher_model is not None and self.teacher_model_server is not None:
-            raise ValueError('GKD requires either `teacher_model` or `teacher_model_server` to be set, not both.')
-
-        # Self-distillation: teacher_model == student model
-        self._teacher_use_disable_adapter = False
-        if self.teacher_model is not None and self.teacher_model == self.model:
-            if self.tuner_type == 'lora':
-                logger.info('LoRA + same teacher_model: using disable_adapter() for fixed teacher (no extra model).')
-                self._teacher_use_disable_adapter = True
-                self.teacher_model = None
-            else:
-                # Full training + same teacher_model: a separate frozen copy will be loaded as fixed teacher.
-                pass
-
-        # Self-distillation: no teacher_model → dynamic teacher (current student weights)
-        if self.teacher_model is None and self.teacher_model_server is None:
-            logger.info('No teacher_model specified. Using self-distillation mode (teacher = student).')
-
-            if self.seq_kd:
-                raise ValueError(
-                    'Self-distillation mode with seq_kd is not supported yet, please specify a teacher_model.')
-            if self.use_liger_kernel:
-                raise ValueError('Self-distillation mode with liger kernel GKD loss is not supported yet')
+        # seq_kd (teacher-generated responses) is not implemented; raise early.
+        if self.seq_kd:
+            raise NotImplementedError('seq_kd=True (Sequential KD with teacher generation) is deprecated.')
 
         # When using teacher_model_server, gkd_logits_topk is required (API only returns top-k logprobs)
         if self.teacher_model_server is not None:
@@ -616,6 +770,3 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if self.gkd_logits_topk is not None and self.use_liger_kernel:
             raise ValueError('gkd_logits_topk is not supported when using liger kernel')
-
-        if self.teacher_model_server and self.seq_kd:
-            raise NotImplementedError('Sequential KD is not supported when using teacher_model_server')

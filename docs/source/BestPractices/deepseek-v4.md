@@ -11,7 +11,7 @@ pip install git+https://github.com/modelscope/mcore-bridge.git
 pip install git+https://github.com/modelscope/ms-swift.git
 
 # Megatron-LM在以下commit hash下进行测试
-# pip install git+https://github.com/NVIDIA/Megatron-LM.git@9af7c7937b6123bb0b22be4d8eb28a8ebf407d7d
+# pip install git+https://github.com/NVIDIA/Megatron-LM.git@fd1121b8ff7e3a4f83a28d35aed172d7bc0260e1
 ```
 
 ## 精度对齐
@@ -192,7 +192,12 @@ megatron sft \
 --pipeline_model_parallel_size 8 \
 --pipeline_model_parallel_layout Et*5|t*5|t*6|t*6|t*6|t*5|t*5|t*5mL \
 ```
-- 暂时不支持`padding_free`和`packing`，但可以通过`group_by_length`加速。暂时不支持TP，待Megatron-Core支持。
+- Packing/CP的支持：需安装mcore-bridge/ms-swift main分支。参考这两个PR：[ms-swift#9705](https://github.com/modelscope/ms-swift/pull/9705)、[mcore-bridge#140](https://github.com/modelscope/mcore-bridge/pull/140)。若要使用CP，你需要额外设置：
+```
+--sequence_packing_scheduler dp_balanced \
+--cp_partition_mode contiguous \
+```
+- 暂时不支持TP，待Megatron-Core支持。
 - FP8训练：你可以设置以下参数开启FP8训练，并最终将权重保存成FP8权重。推荐使用全参数训练。如果要使用LoRA + FP8，你需要只保存LoRA权重（设置`--merge_lora false`），并使用BF16权重进行Merge-LoRA（FP8 精度有限，LoRA delta 会被舍入为 0）。参考[这个例子](https://github.com/modelscope/ms-swift/blob/main/examples/megatron/fp8/lora.sh)。
 ```
 --fp8_recipe blockwise \
@@ -214,3 +219,41 @@ swift infer \
 推理结果：
 
 ![result](../../resources/deepseek_v4/infer_result.png)
+
+跑通vLLM推理：
+
+- 如果要使用vllm推理，你可以参考[这里的文档](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash)。你需要FP4/FP8精度的权重。
+- 此外你需要copy原始的'config.json'文件，并修改'expert_dtype'（与训练后的config.json一致）。因为，使用transformers的`config.save_pretrained`保存的文件与原始文件不同，vllm不兼容保存后的文件。
+- 如果遇到tilelang问题，可以查看[这个issue](https://github.com/modelscope/ms-swift/issues/9494)。
+- mcore-bridge DeepSeek-V4 Fp8修复：[PR](https://github.com/modelscope/mcore-bridge/pull/133)。
+
+这里先做量化（这里的量化会导致LoRA增量信息丢失，这里只作为例子，建议使用FP8全参数训练并导出FP8权重）：
+
+```shell
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NPROC_PER_NODE=8 \
+megatron export \
+    --model megatron_output/DeepSeek-V4-Flash/vx-xxx/checkpoint-xxx-merged \
+    --output_dir megatron_output/DeepSeek-V4-Flash/vx-xxx/checkpoint-xxx-merged-FP8 \
+    --to_hf true \
+    --fp8_recipe blockwise \
+    --fp8_format e4m3 \
+    --fp8_param_gather true \
+    --mtp_num_layers 1 \
+    --expert_model_parallel_size 8
+```
+
+vLLM启动命令：
+```shell
+vllm serve megatron_output/DeepSeek-V4-Flash/vx-xxx/checkpoint-xxx-merged-FP8 \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --block-size 256 \
+    --enable-expert-parallel \
+    --tensor-parallel-size 8 \
+    --max-model-len 8192 \
+    --tokenizer-mode deepseek_v4 \
+    --tool-call-parser deepseek_v4 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v4
+```

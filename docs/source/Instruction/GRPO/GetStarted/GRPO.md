@@ -37,10 +37,10 @@ completions = rollout_function(
 )
 """
 completions = [
-    (completion 1) "The larger number is 9.11...",
-    (completion 2) "9.9 is bigger than...",
+    (completion 1) "The larger number is 9.9...",
+    (completion 2) "9.11 is bigger than...",
     ...
-    (completion 8) "After calculation, 9.11..."
+    (completion 8) "After calculation, 9.9..."
 ]
 """
 
@@ -48,7 +48,7 @@ completions = [
 # Evaluate generated completions using reward model
 rewards = reward_function(
     completions=completions,
-    ground_truth="9.11"  # Expected correct answer
+    ground_truth="9.9"  # Expected correct answer
 )
 """
 rewards = [
@@ -190,7 +190,7 @@ swift rollout \
 
 更多 rollout 参数参考[vLLM参数](../../../Instruction/Command-line-parameters.md#vllm参数)和[rollout 参数](../../../Instruction/Command-line-parameters.md#rollout参数)
 
-注意：在使用 use_async_engine 时，仅开启 DP 可能会导致错误，相关问题参考： [vllm issue](https://github.com/vllm-project/vllm/issues/18567)。如果出现错误，请尝试同时启用 TP 和 DP，或升级vLLM
+注意：在使用 vllm_use_async_engine 时，仅开启 DP 可能会导致错误，相关问题参考： [vllm issue](https://github.com/vllm-project/vllm/issues/18567)。如果出现错误，请尝试同时启用 TP 和 DP，或升级vLLM
 
 
 训练使用以下参数配置外部 vLLM 服务器

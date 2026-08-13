@@ -1,17 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import concurrent.futures
-import importlib.metadata
+import inspect
 import logging
 import os
 import torch
 import torch.distributed as dist
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from packaging import version
 from tqdm import tqdm
 from transformers.modeling_utils import custom_object_save
 from transformers.utils import is_torch_npu_available
-from transformers.utils.versions import require_version
+from typing import Union
 
 from swift.model import get_model_processor, save_checkpoint
 from swift.utils import (HfConfigFactory, disable_safe_ddp_context_use_barrier, get_logger, get_modules_to_not_convert,
@@ -75,6 +74,22 @@ def _patch_torch_FileSystemReader():
     FileSystemReader.read_data = read_data
 
 
+def _dcp_validation_returns_errors(default_planner) -> bool:
+    """Whether `_validate_global_plan` is expected to return a list of error messages."""
+    try:
+        # The caller is what defines the contract, so it is the most reliable thing to inspect.
+        source = inspect.getsource(default_planner.DefaultSavePlanner._create_global_plan)
+        return 'validation_errors' in source
+    except (OSError, TypeError):
+        pass
+    annotation = inspect.signature(default_planner._validate_global_plan).return_annotation
+    if annotation is inspect.Signature.empty:
+        logger.warning(f'Could not determine the `_validate_global_plan` contract of torch=={torch.__version__}; '
+                       'assuming the legacy boolean form.')
+        return False
+    return annotation not in (bool, 'bool')
+
+
 def _patch_validate_non_overlapping_shards_metadata():
     # too slow
     from torch.distributed._shard.sharded_tensor import api
@@ -87,8 +102,19 @@ def _patch_validate_non_overlapping_shards_metadata():
     api.validate_non_overlapping_shards_metadata = validate_non_overlapping_shards_metadata
     api2.validate_non_overlapping_shards_metadata = validate_non_overlapping_shards_metadata
 
-    def _validate_global_plan(*args, **kwargs):
-        return True
+    # The return contract changed across torch versions: it used to be a bool (falsy meaning
+    # "invalid"), while newer versions return a list of error messages (empty meaning "valid").
+    # Returning the wrong type is not harmless -- a bool sends the newer caller into its error
+    # branch, where `'; '.join(True)` raises `TypeError: can only join an iterable` and buries the
+    # real reason for the failure.
+    if _dcp_validation_returns_errors(default_planner):
+
+        def _validate_global_plan(*args, **kwargs):
+            return []
+    else:
+
+        def _validate_global_plan(*args, **kwargs):
+            return True
 
     default_planner._validate_global_plan = _validate_global_plan
 
@@ -117,7 +143,6 @@ def _patch_unified_memory():
 
 
 def _patch_mcore_bridge():
-    require_version('mcore-bridge>=1.4.0', 'please install mcore-bridge via `pip install mcore-bridge -U`')
     import mcore_bridge
     from mcore_bridge import GPTBridge
     logger.info(f'mcore_bridge.__version__: {mcore_bridge.__version__}')
@@ -131,8 +156,15 @@ def _patch_mcore_bridge():
         max_shard_size: str = '5GB',
         args=None,
         processor=None,
+        save_missing_weights: Union[bool, str] = False,
     ) -> None:
-        origin_save_weights(self, mg_models, output_dir, peft_format=peft_format, max_shard_size=max_shard_size)
+        origin_save_weights(
+            self,
+            mg_models,
+            output_dir,
+            peft_format=peft_format,
+            max_shard_size=max_shard_size,
+            save_missing_weights=save_missing_weights)
         if processor is None or args is None:
             return
         hf_config = self.config.hf_config
@@ -177,12 +209,16 @@ def _patch_mcore_bridge():
                     else:
                         llm_config.num_nextn_predict_layers = config.mtp_num_layers
                 HfConfigFactory.del_config_attr(hf_config, 'quantization_config')
+                expert_dtype = None
                 if config.fp8 is not None and config.fp8_recipe == 'blockwise' and config.fp8_param:
                     from transformers.utils.quantization_config import FineGrainedFP8Config
                     modules_to_not_convert = get_modules_to_not_convert(self.hf_model)
                     if hasattr(self, '_fp8_skip_modules'):
                         modules_to_not_convert = (modules_to_not_convert or []) + list(self._fp8_skip_modules)
                     hf_config.quantization_config = FineGrainedFP8Config(modules_to_not_convert=modules_to_not_convert)
+                    expert_dtype = 'fp8'
+                if args.model_type == 'deepseek_v4':
+                    HfConfigFactory.set_config_attr(hf_config, 'expert_dtype', expert_dtype)
                 hf_config.save_pretrained(output_dir)
                 if getattr(self.hf_model, '_auto_class') is not None:
                     try:
@@ -205,7 +241,9 @@ def init_megatron_env():
     os.environ.pop('VLLM_USE_MODELSCOPE', None)
     logging_level = logging.root.level
     _patch_unified_memory()
-    _patch_mcore_bridge()
+    if is_torch_npu_available():
+        from swift.model.npu_patcher import patch_mindspeed_fla_gdn_implementation
+        patch_mindspeed_fla_gdn_implementation()
     _patch__batched_p2p_ops()
     logging.root.setLevel(logging_level)  # revert logger level
     try:

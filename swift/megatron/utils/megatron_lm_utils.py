@@ -13,14 +13,13 @@ from datetime import timedelta
 from mcore_bridge import set_random_seed, split_cp_inputs, unwrap_model
 from megatron.core import dist_checkpointing, mpu, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.dist_checkpointing.serialization import (get_default_load_sharded_strategy,
-                                                            get_default_save_sharded_strategy)
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (FullyParallelLoadStrategyWrapper,
                                                                         FullyParallelSaveStrategyWrapper)
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
@@ -217,6 +216,10 @@ def _preprocess_common_before_consistancy_check(common_state_dict):
 
 def get_sharded_sd_metadata(args):
     sharded_sd_metadata = {'singleton_local_shards': False, 'chained_optim_avoid_prefix': True}
+    if getattr(args, 'use_megatron_fsdp', False):
+        # Megatron-FSDP shards the distributed optimizer state as DTensors.
+        sharded_sd_metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
+        return sharded_sd_metadata
     force_pre_mcore_014 = not is_torch_min_version('2.6a0')
     if force_pre_mcore_014 and not args.dist_ckpt_save_pre_mcore_014:
         args.dist_ckpt_save_pre_mcore_014 = True
@@ -266,6 +269,7 @@ def save_mcore_checkpoint(
     if mcore_017:
         save_strategy = TorchDistSaveShardedStrategy()
     else:
+        from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
         save_strategy = get_default_save_sharded_strategy()
     save_strategy = FullyParallelSaveStrategyWrapper(
         save_strategy,
@@ -455,6 +459,7 @@ def load_mcore_checkpoint(args,
     if mcore_017:
         load_strategy = TorchDistLoadShardedStrategy()
     else:
+        from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
         load_strategy = get_default_load_sharded_strategy(checkpoint_dir)
 
     load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
@@ -517,7 +522,8 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
 
     # DDP
     if not wrap_with_ddp:
-        return
+        return models
+
     kwargs = {}
     for f in dataclasses.fields(DistributedDataParallelConfig):
         if hasattr(args, f.name):
@@ -541,9 +547,16 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
     if not ddp_config.overlap_grad_reduce:
         ddp_config.bucket_size = None
 
-    with torch.cuda.stream(torch.cuda.Stream()):
+    # Setup stream for DDP initialization with proper synchronization.
+    ddp_stream = torch.cuda.Stream()
+    ddp_stream.wait_stream(torch.cuda.current_stream())
+    if getattr(args, 'use_megatron_fsdp', False):
+        DP = megatron_FSDP
+    else:
+        DP = DDP
+    with torch.cuda.stream(ddp_stream):
         models = [
-            DDP(
+            DP(
                 config=config,
                 ddp_config=ddp_config,
                 module=model_chunk,
@@ -552,6 +565,8 @@ def wrap_model(args, models, wrap_with_ddp: bool = True):
                 disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
             ) for (model_chunk_idx, model_chunk) in enumerate(models)
         ]
+    # Ensure DDP initialization completes before proceeding on the default stream.
+    torch.cuda.current_stream().wait_stream(ddp_stream)
 
     # Broadcast params from data parallel src rank to other data parallel ranks.
     if args.data_parallel_random_init:
@@ -596,7 +611,10 @@ def get_optimizer_param_scheduler(args, optimizer):
 
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
-    return args.use_distributed_optimizer and args.overlap_param_gather
+    # Megatron-FSDP manages its own param all-gather, so the distributed optimizer's
+    # forward pre-hook must not be disabled/enabled for it.
+    return (not getattr(args, 'use_megatron_fsdp', False) and args.use_distributed_optimizer
+            and args.overlap_param_gather)
 
 
 def enable_forward_pre_hook(model_chunks):
@@ -718,12 +736,20 @@ def get_batch_on_this_cp_rank(args, batch: Dict[str, Any]):
             keys.append('input_ids')
 
         packed_seq_params = batch.get('packed_seq_params')
+        cp_partition_mode = getattr(args, 'cp_partition_mode', 'zigzag')
+        kwargs = {}
+        if cp_partition_mode == 'contiguous':
+            kwargs['cp_partition_mode'] = 'contiguous'
         for key, val in batch.items():
             if key not in keys:
                 continue
             if args.task_type in ('seq_cls', 'embedding', 'generative_reranker') and key == 'labels':
                 continue
             if val is not None:
-                batch[key] = split_cp_inputs(val, getattr(packed_seq_params, 'cu_seqlens_q', None), -1)
+                batch[key] = split_cp_inputs(val, getattr(packed_seq_params, 'cu_seqlens_q', None), -1, **kwargs)
+        attention_mask = batch.get('attention_mask')
+        if is_torch_npu_available() and attention_mask is not None and attention_mask.ndim >= 4:
+            batch['attention_mask'] = split_cp_inputs(attention_mask, getattr(packed_seq_params, 'cu_seqlens_q', None),
+                                                      -2, **kwargs)
 
     return batch

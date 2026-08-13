@@ -12,6 +12,28 @@
 4. 使用“快速跑通”完成一次 ModelScope 模型 LoRA 训练、合并、推理和部署。
 5. 需要更大规模训练时，再阅读 DDP、DeepSpeed 和 MindSpeed/Megatron-SWIFT 相关章节。
 
+## 硬件配套和支持的操作系统
+
+**表 1**  产品硬件支持列表
+
+|产品|是否支持|
+|--|:-:|
+|<term>Ascend 950 系列产品</term>|√|
+|<term>Atlas A3 训练系列产品</term>|√|
+|<term>Atlas A3 推理系列产品</term>|x|
+|<term>Atlas A2 训练系列产品</term>|√|
+|<term>Atlas A2 推理系列产品</term>|x|
+|<term>Atlas 200I/500 A2 推理产品</term>|x|
+|<term>Atlas 推理系列产品</term>|x|
+|<term>Atlas 训练系列产品</term>|x|
+
+> [!NOTE]
+>
+> 本节表格中“√”代表支持，“x”代表不支持。
+
+- 各硬件产品对应物理机部署场景支持的操作系统请参考[兼容性查询助手](https://www.hiascend.com/hardware/compatibility)。
+- 各硬件产品对应虚拟机及容器部署场景支持的操作系统请参考《CANN 软件安装》的“[操作系统兼容性说明](https://www.hiascend.com/document/detail/zh/canncommercial/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum)”章节（商用版）或“[操作系统兼容性说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum)”章节（社区版）。
+
 ## 支持范围速览
 
 推荐基础环境版本：
@@ -88,6 +110,19 @@
 | 使用sglang作为推理引擎            |
 | 使用megatron时开启ETP进行lora训练 |
 
+### PEFT Transformers 5 MoE fused expert LoRA 限制
+
+在使用 Qwen3.5-MoE、Qwen3-Omni-MoE 等 Transformers 5 MoE 结构模型进行 LoRA 训练时，部分 expert 权重可能不是普通 `nn.Linear` 模块，而是 fused `nn.Parameter`。这类参数需要依赖 PEFT 的 `target_parameters` 路径注入 LoRA。
+
+当前该路径在 `lora_dropout`、ZeRO-3/FSDP、多 adapter 等组合场景下仍未完全稳定。典型触发条件包括：
+
+- 使用 MoE 模型；
+- 使用 LoRA，并希望覆盖 fused expert 参数；
+- 模型配置或命令行 `--model_type` 触发 PEFT 的 Transformers 5 MoE target conversion 路径；
+- 使用默认 `lora_dropout != 0`，或使用 ZeRO-3/FSDP 等参数分片后端。
+
+如果只是进行常规 Qwen3.5 GRPO/SFT LoRA 训练，建议避免额外指定 `--model_type` 去扩大触发范围；若模型配置本身已经触发该路径，则优先使用 full 参数训练或关闭对应 LoRA 组合。若确实需要训练 fused expert 参数，建议等待 PEFT 上游能力稳定，或在 `lora_dropout=0` 且目标模型、训练后端已单独验证的前提下使用。
+
 ## 选择你的使用路线
 
 | 场景                         | 推荐路线                                      | 是否需要 MindSpeed |
@@ -100,9 +135,17 @@
 ## 环境准备
 
 ### 镜像/容器环境安装
-官方 NPU 镜像仍在发布流程中。在镜像正式发布前，推荐使用项目提供的 Dockerfile 自行构建一个包含 CANN、PyTorch、torch_npu 与 ms-swift 依赖的容器环境。容器方式的优势是依赖版本更容易固化，也便于在多台昇腾机器之间复现实验环境。
+官方 NPU 镜像已发布在 [quay.io/ascend/ms-swift](https://quay.io/repository/ascend/ms-swift?tab=tags)。推荐优先根据设备代际、Python、CANN 和系统版本选择匹配的镜像标签；如需锁定分支或定制依赖，再使用项目提供的 Dockerfile 自行构建。容器方式的优势是依赖版本更容易固化，也便于在多台昇腾机器之间复现实验环境。
 
-先 clone modelscope 仓库，然后使用仓库中的 [Dockerfile.ascend](https://github.com/modelscope/modelscope/blob/master/docker/Dockerfile.ascend) 和 [build_image.py](https://github.com/modelscope/modelscope/blob/master/docker/build_image.py) 构建镜像：
+下面以 A2、Python 3.11、CANN 9.0.0、Ubuntu 22.04 标签为例，实际使用时请以 Quay 标签页中适配当前机器和软件栈的最新标签为准：
+
+```shell
+docker pull quay.io/ascend/ms-swift:v4.3.0-A2-py311-CANN9.0.0-ubuntu22.04
+export IMAGE_NAME=quay.io/ascend/ms-swift:v4.3.0-A2-py311-CANN9.0.0-ubuntu22.04
+export WORKSPACE=/path/to/workspace
+```
+
+如果需要自行构建镜像，先 clone modelscope 仓库，然后使用仓库中的 [Dockerfile.ascend](https://github.com/modelscope/modelscope/blob/master/docker/Dockerfile.ascend) 和 [build_image.py](https://github.com/modelscope/modelscope/blob/master/docker/build_image.py)：
 
 ```shell
 git clone https://github.com/modelscope/modelscope.git
@@ -114,11 +157,10 @@ DOCKER_REGISTRY=ms-swift python docker/build_image.py \
   --arch arm
 ```
 
-当前 `build_image.py` 生成的 Ascend 镜像名格式为 `{DOCKER_REGISTRY}:{swift_branch}-{atlas_hardware}-{python_tag}-{arch}`。以上命令以 ARM 架构的 Atlas 900 A2 PODc 为例，通常会生成 `ms-swift:main-A2-py311-arm`。下面用变量保存镜像名和工作目录，实际使用时请按构建日志中的镜像名替换：
+当前 `build_image.py` 生成的 Ascend 镜像名格式为 `{DOCKER_REGISTRY}:{swift_branch}-{atlas_hardware}-{python_tag}-{arch}`。以上命令以 ARM 架构的 Atlas 900 A2 PODc 为例，通常会生成 `ms-swift:main-A2-py311-arm`。如果使用自行构建的镜像，请按构建日志中的镜像名替换上面的 `IMAGE_NAME`：
 
 ```shell
 export IMAGE_NAME=ms-swift:main-A2-py311-arm
-export WORKSPACE=/path/to/workspace
 ```
 
 启动容器前建议先确认宿主机暴露的 NPU 设备：
@@ -236,43 +278,32 @@ python -c "import mindspeed.megatron_adaptor; from swift.megatron.init import in
 
 ### Qwen3.5 FLA补丁说明
 
-当前仓库已经内置了面向昇腾 NPU 的 Qwen3.5 linear attention patch，无需用户再额外修改 `transformers` 或 `fla` 源码。该 patch 的目标不是直接替换整个 `flash-linear-attention` 包，而是在 `Qwen3.5` 实际调用的 `chunk_gated_delta_rule` 路径上，将底层 GPU Triton 算子重定向到 MindSpeed 的 NPU 实现。
+Qwen3.5 在昇腾 NPU 上直接使用 `flash-linear-attention`（FLA）的原生 Triton-Ascend GDN backend。ms-swift 不再内置或维护一份 MindSpeed `chunk_gated_delta_rule` 副本。
 
-补丁生效时，ms-swift 会执行以下替换：
+ms-swift 只保留两处 NPU 兼容处理：
 
-1. 将 `transformers.utils.is_flash_linear_attention_available` 与 `transformers.utils.import_utils.is_flash_linear_attention_available` 置为 `True`，使 `transformers.models.qwen3_5.modeling_qwen3_5` 可以按 FLA fast path 完成初始化。
-2. 将 `transformers.models.qwen3_5.modeling_qwen3_5.chunk_gated_delta_rule` 以及 `transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.chunk_gated_delta_rule` 重定向到 ms-swift 内置实现 `swift.model.chunk_gated_delta_rule.chunk_gated_delta_rule`。
-3. `swift.model.chunk_gated_delta_rule` 内部继续调用 MindSpeed 提供的原生 Triton 算子，包括：
-   - `mindspeed.lite.ops.triton.chunk_delta_h`
-   - `mindspeed.lite.ops.triton.chunk_o`
-   - `mindspeed.lite.ops.triton.chunk_scaled_dot_kkt`
-   - `mindspeed.lite.ops.triton.wy_fast`
-4. 保留了 torch 原生 l2norm 小算子实现，减轻每层每步的 launch 开销以及冷启动中的 compile/autotune 开销，提升模型在 NPU 上的性能表现。
-5. 对于 FLA 中依赖 `torch.cuda.current_device()` 初始化的 `FusedRMSNormGated`，NPU 上会保留 Qwen3.5 的原生 torch 路径，避免 CUDA-only 初始化逻辑带来的兼容性问题。
+1. Transformers 的 FLA 可用性检查包含 CUDA 条件，ms-swift 会在 NPU 上按 FLA 的公共 causal-conv 与 GDN 入口是否可导入补充判断。具体 NPU backend 的选择与校验由 FLA 自己负责。
+2. Transformers 当前使用 `torch.cuda.current_device()` 初始化 `FusedRMSNormGated`，因此 NPU 上仍保留 Qwen3.5 原生 torch norm；这不影响 GDN 使用 FLA。
 
 可以将这条调用链理解为：
 
 ```text
 Qwen3.5 modeling.chunk_gated_delta_rule
-    -> swift.model.chunk_gated_delta_rule.chunk_gated_delta_rule
-    -> MindSpeed Triton kernels
+    -> fla.ops.gated_delta_rule.chunk_gated_delta_rule
+    -> fla.ops.gated_delta_rule.backends.triton_ascend
 ```
 
-因此：
-
-- 该 patch 主要覆盖的是 **Qwen3.5 linear attention 的 gated-delta-rule 路径**；
-- 它并不等价于“将整个 fla 包完整替换为 MindSpeed”；
-- 若需要这条路径生效，请确保当前环境中可以正确导入 MindSpeed 和 triton ascend
-- 精度对齐验证版本：torch 2.9.0 + MindSpeed 0.16.0 + flash-linear-attention 0.4.2 + triton-ascend 3.2.1 + transformers 5.2.0
+- 当前请安装 FLA main 分支最新版本以获得 NPU GDN 支持。
+- 当前验证环境：torch 2.9.0+cpu、torch-npu 2.9.0.post2、FLA 0.5.2 main、triton-ascend 3.2.1、transformers 5.12.1。
 
 
-当前 Qwen3.5 在 NPU 上如果走 Megatron-SWIFT 训练，还需要额外注意版本和功能约束：
+当前 Qwen3.5 在 NPU 上如果走 transformers 后端或 Megatron-SWIFT 后端训练，还需要额外注意版本和功能约束：
 
-1. 当前 NPU 文档中约定的 MindSpeed 训练组合是 `Megatron-LM v0.16.0 + MindSpeed core_r0.16.0`。在这个组合下，`megatron-core` 已包含 `core.ssm.gated_delta_net` 原生 GDN 内核，`mcore-bridge` 默认会按 `USE_MCORE_GDN=1` 走 Megatron-Core/MindSpeed GDN 路径。只有在需要主动回退到 transformers 版 GDN 时，才需要显式设置 `USE_MCORE_GDN=0`，将 GDN 切回由 `mcore-bridge` 包装的 transformers 原生实现，再配合 ms-swift 内置的 Qwen3.5 FLA NPU 补丁，把 `chunk_gated_delta_rule` 重定向到 MindSpeed Triton 算子。这条回退路径的已知代价是：
+1. 当前 NPU 文档中约定的 MindSpeed 训练组合是 `Megatron-LM v0.16.0 + MindSpeed core_r0.16.0`。在这个组合下，`mcore-bridge` 默认按 `USE_MCORE_GDN=1` 走 Megatron-Core/MindSpeed GDN；若显式设置 `USE_MCORE_GDN=0`，则走 transformers 版 GDN。该路径会优先尝试使用上述 FLA Triton-Ascend backend；FLA 不可用时仅记录 warning 并保留当前 MindSpeed/Megatron 选择的 GDN 实现，不主动替换为 Torch 实现，因此 FLA 不是普通 Megatron 训练的强依赖。
 
-   - transformers 版 GDN 不支持 packing，也不支持 GDN 的 TP/CP。
+2. MindSpeed 初始化以及训练参数 `repatch()` 可能会替换 FLA 的公共 GDN 入口。ms-swift 会在构建 `mcore-bridge` 前和 `repatch()` 后，优先从 MindSpeed patch manager 保存的 `orig_func` 恢复 FLA 原始 callable；仅在成功恢复 FLA 时才同步刷新 `mcore-bridge` 已缓存的 callable。如果 FLA 缺失或恢复失败，则不修改当前 GDN callable，并记录 warning。packed/varlen 能力取决于保留的实现；如果它不支持非空 `cu_seqlens`，实际 GDN 调用会直接失败，此时需要安装可用的 FLA。
 
-2. 如果使用 `USE_MCORE_GDN=1` 的 0.16 原生 GDN 路径，上述限制不应套用到该路径；原生路径的 packing、TP/CP、mask 链路和并行组合仍需以当前 MindSpeed/Megatron-LM、mcore-bridge 与目标脚本的实际验证为准。
+3. 已在 8 卡 Atlas 900 A2 上完成 Qwen3.5-4B 的 Transformers/FSDP LoRA 验证：BF16、`alpaca-gpt4-data-zh`、`packing=true`、`max_length=512`、每卡 batch size 1、梯度累积 1，共训练 300 steps；全程 loss/grad_norm 为有限值，并成功保存 checkpoint。相同配置下，NPU 与 GPU 对照实验的 loss 变化趋势对齐。
 
 ### 环境查看
 

@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+import re
 import torch
 import transformers
 from packaging import version
@@ -112,6 +113,33 @@ def get_target_modules(args, model) -> Union[str, List[str]]:
     if 'all-embedding' in target_modules:
         target_modules.remove('all-embedding')
         target_modules += find_embedding(model)
+    target_modules = _drop_mamba_incompatible_targets(target_modules, model)
+    return target_modules
+
+
+# PEFT >= 0.20 hard-rejects LoRA on these Mamba modules
+# (peft/tuners/tuners_utils.py::_check_lora_target_modules_mamba, set: {out_proj, conv1d}).
+_MAMBA_MODEL_TYPES = {'falcon_h1', 'mamba', 'mamba2', 'falcon_mamba', 'nemotron_h'}
+_MAMBA_INCOMPATIBLE_MODULES = {'out_proj', 'conv1d'}
+
+
+def _drop_mamba_incompatible_targets(target_modules, model):
+    """Strip Mamba-incompatible module names from a resolved target_modules list.
+
+    `all-linear` expands to include the Mamba mixer's `out_proj` (an nn.Linear), which PEFT
+    then refuses to wrap, aborting the run. Only touches list targets on Mamba model types;
+    a str/regex target is returned unchanged.
+    """
+    if not isinstance(target_modules, list):
+        return target_modules
+    model_type = getattr(getattr(model, 'config', None), 'model_type', None)
+    if model_type not in _MAMBA_MODEL_TYPES:
+        return target_modules
+    dropped = [m for m in target_modules if m in _MAMBA_INCOMPATIBLE_MODULES]
+    if dropped:
+        target_modules = [m for m in target_modules if m not in _MAMBA_INCOMPATIBLE_MODULES]
+        logger.info(f'Dropped Mamba-incompatible LoRA target modules {sorted(set(dropped))} for '
+                    f"model_type='{model_type}' (PEFT rejects LoRA on these).")
     return target_modules
 
 
@@ -255,10 +283,13 @@ def prepare_adapter(args: SftArguments, model, *, template=None, train_dataset=N
     elif args.tuner_type == 'adapter':
         model_arch = model.model_meta.model_arch
         mlp_key = model_arch.mlp
-        mlp_key = mlp_key.split('.{}.')[1]
+        # Match the full module path (scoped to the language model) rather than the bare
+        # `mlp` suffix. Otherwise vision-tower MLPs (e.g. `visual.blocks.*.mlp`) would also
+        # be matched, causing a hidden_size mismatch on multimodal models.
+        target_modules = re.escape(mlp_key).replace(re.escape('{}'), r'\d+')
         adapter_config = AdapterConfig(
-            dim=model.config.hidden_size,
-            target_modules=[mlp_key],
+            dim=model.config.get_text_config().hidden_size,
+            target_modules=target_modules,
             hidden_pos=0,
             adapter_length=args.adapter_length,
             act_layer=args.adapter_act)

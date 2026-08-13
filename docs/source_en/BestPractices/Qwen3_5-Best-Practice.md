@@ -6,14 +6,14 @@ ms-swift supports training [Qwen3.5](https://github.com/QwenLM/Qwen3.5) Dense/Mo
 
 ```shell
 pip install -U ms-swift
-# "transformers==5.2.*" encounters compatibility issues with vllm. See this issue: https://github.com/modelscope/ms-swift/issues/8254
-# "transformers==5.3.*" encounters video training issues. See this issue: https://github.com/modelscope/ms-swift/issues/8362
-pip install -U "transformers==5.2.*" "qwen_vl_utils>=0.0.14" peft liger-kernel
+pip install -U "transformers>=5.9" "qwen_vl_utils>=0.0.14" peft liger-kernel
 
 # flash-linear-attention
 # If you encounter slow training issues, please refer to: https://github.com/fla-org/flash-linear-attention/issues/758
 # Please use Python 3.12: https://github.com/fla-org/flash-linear-attention/issues/121
 pip install -U "flash-linear-attention>=0.4.2" --no-build-isolation
+# For Ascend NPU GDN, install the latest main branch (replace the command above)
+pip install -U git+https://github.com/fla-org/flash-linear-attention.git --no-build-isolation
 
 # causal_conv1d
 pip install -U git+https://github.com/Dao-AILab/causal-conv1d --no-build-isolation
@@ -26,12 +26,10 @@ pip install deepspeed
 
 # vllm (torch2.10) for inference/deployment/RL
 pip install -U "vllm>=0.17.0"
-# For RL training, need to override vllm's default installation version
-pip install -U "transformers==5.2.*"
 ```
 
 - Qwen3.5 video data training hangs: Using the decord backend to read videos may cause hanging issues, refer to [this issue](https://github.com/dmlc/decord/issues/269). You can use the torchcodec backend, specifically refer to the [qwen_vl_utils](https://github.com/QwenLM/Qwen3-VL/blob/50068df2334f309979ff05d75f1078c8309c63ed/qwen-vl-utils/src/qwen_vl_utils/vision_process.py#L390-L400) library.
-- If you are using Qwen3.5 on Ascend NPU and want details about the FLA / MindSpeed replacement, effective patch path, and verified version combinations, please refer to [Qwen3.5 FLA Patch Notes in the NPU Support document](./NPU-support.md#qwen35-fla-patch-notes).
+- If you are using Qwen3.5 on Ascend NPU and want details about the FLA GDN call path and verified version combinations, please refer to [Qwen3.5 FLA Patch Notes in the NPU Support document](./NPU-support.md#qwen35-fla-patch-notes).
 
 ## Inference
 
@@ -312,7 +310,8 @@ Tips for training Qwen3.5 with Megatron-SWIFT:
 - TP Limitation Removed: Using `megatron-core>=0.16` removes the `num_query_groups` limitation on TP.
 - Regarding MTP training: `mcore-bridge>=1.1.0` supports multimodal MTP training. Please install the corresponding version.
 - CP support: "mcore-bridge>=1.1.0" supports CP training for GDN. Additionally, the megatron-core [main branch](https://github.com/NVIDIA/Megatron-LM) needs to be installed.
-- By default, `GatedDeltaNet` uses the Megatron implementation, which requires "megatron-core>=0.16" (ms-swift>=4.1.0; previous versions defaulted to the transformers implementation). Set the environment variable `USE_MCORE_GDN=0` to switch to the transformers implementation. **Note that the transformers implementation does not support packing and GDN's TP/CP**.
+- Transformers/FSDP packing validation: Qwen3.5-4B has completed 300 training steps on 8 Atlas 900 A2 cards with LoRA, BF16, `alpaca-gpt4-data-zh`, `packing=true`, `max_length=512`, per-device batch size 1, and gradient accumulation 1. Loss and grad norm remained finite throughout, and a checkpoint was saved successfully. Under the same configuration, the NPU loss trend aligned with the GPU reference.
+- By default, `GatedDeltaNet` uses the Megatron implementation, which requires "megatron-core>=0.16" (ms-swift>=4.1.0; previous versions defaulted to the transformers implementation). Set `USE_MCORE_GDN=0` to switch to the transformers model path; on Ascend NPU, this path can use FLA's native Triton-Ascend GDN.
 - Support for padding_free/packing: Packing can improve training speed. Refer to [this example](https://github.com/modelscope/ms-swift/tree/main/examples/models/qwen3_5/packing.sh).
   - Qwen3-Next Megatron GatedDeltaNet support refers to [this PR](https://github.com/modelscope/mcore-bridge/pull/76), requiring `mcore-bridge>=1.4.0`.
 - apply_wd_to_qk_layernorm: Apply weight decay to qk layernorm. Default is False.
@@ -490,16 +489,18 @@ Evaluation results on AIME-2025 and MATH-500:
 
 ### GKD
 
-LoRA training with GKD (Guided Knowledge Distillation), using Qwen3.5-9B as the teacher model. First, launch the teacher server with vLLM (alternatively, use the `--teacher_model` parameter to load the model directly):
+LoRA training with GKD (General Knowledge Distillation), using Qwen3.5-9B as the teacher model. First, launch the teacher server with `swift deploy` (alternatively, use the `--teacher_model` parameter to load the model directly):
 
 ```shell
 CUDA_VISIBLE_DEVICES=0 \
-vllm serve Qwen/Qwen3.5-9B \
+swift deploy \
+    --model Qwen/Qwen3.5-9B \
+    --infer_backend vllm \
     --port 8000 \
-    --tensor-parallel-size 1 \
-    --max-model-len 10240 \
+    --vllm_tensor_parallel_size 1 \
+    --vllm_max_model_len 10240 \
     --gpu-memory-utilization 0.8 \
-    --max-logprobs 64
+    --max_logprobs 64
 ```
 
 Then start GKD training on the remaining GPUs:
@@ -522,7 +523,6 @@ swift rlhf \
     --sleep_level 0 \
     --dataset 'modelscope/gsm8k' \
     --lmbda 1 \
-    --seq_kd false \
     --beta 0.5 \
     --torch_dtype bfloat16 \
     --per_device_train_batch_size 2 \
